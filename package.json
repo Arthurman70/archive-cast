@@ -1,0 +1,15 @@
+{
+  "name": "archive-cast",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Chrome extension: cast whole shows to a Chromecast in order with autoplay (archive.org, podcasts, other sites), scriptable by AI agents via JS API and MCP.",
+  "license": "MIT",
+  "repository": "github:Arthurman70/archive-cast",
+  "engines": { "node": ">=22" },
+  "bin": { "archive-cast-mcp": "mcp/server.mjs" },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\"",
+    "test:e2e": "cd test/e2e && npm install && npm test",
+    "mcp": "node mcp/server.mjs"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "archive-cast-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests: loads the extension into a throwaway Chrome profile.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.12.0"
+  }
+}

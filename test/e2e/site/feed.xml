@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>The Test Hour</title>
+    <itunes:image href="/art.png"/>
+    <!-- newest first, like real feeds; Archive Cast plays oldest first -->
+    <item>
+      <title>Episode 4: Finale</title>
+      <pubDate>Thu, 04 Jan 2024 10:00:00 GMT</pubDate>
+      <itunes:duration>00:00:40</itunes:duration>
+      <enclosure url="/media/feed-4.mp3" type="audio/mpeg" length="500000"/>
+    </item>
+    <item>
+      <title>Episode 3: Rising Action</title>
+      <pubDate>Wed, 03 Jan 2024 10:00:00 GMT</pubDate>
+      <itunes:duration>40</itunes:duration>
+      <enclosure url="/media/feed-3.mp3" type="audio/mpeg" length="500000"/>
+    </item>
+    <item>
+      <title>Episode 2: Complications</title>
+      <pubDate>Tue, 02 Jan 2024 10:00:00 GMT</pubDate>
+      <itunes:duration>0:40</itunes:duration>
+      <enclosure url="/media/feed-2.mp3" type="audio/mpeg" length="500000"/>
+    </item>
+    <item>
+      <title>Episode 1: Beginnings</title>
+      <pubDate>Mon, 01 Jan 2024 10:00:00 GMT</pubDate>
+      <itunes:duration>40</itunes:duration>
+      <enclosure url="/media/feed-1.mp3" type="audio/mpeg" length="500000"/>
+    </item>
+    <item>
+      <title>Show notes only (no audio)</title>
+      <pubDate>Sun, 31 Dec 2023 10:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>
