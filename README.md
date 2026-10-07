@@ -2,7 +2,7 @@
 
 **Cast whole shows to your Chromecast, in order and with autoplay, without casting your screen.**
 
-Archive Cast is a Chrome extension. It sends a show's episode files straight to your Chromecast as a queue. The TV fetches and plays them on its own, so your computer stays free and the next episode starts by itself. It works on the [Internet Archive](https://archive.org), on podcast sites, and on other sites with plain video or audio. It can also make a site's own Cast player continue to the next episode when it normally stops after one.
+Archive Cast is an extension for Chrome and Brave. It sends a show's episode files straight to your Chromecast as a queue. The TV fetches and plays them on its own, so your computer stays free and the next episode starts by itself. It works on the [Internet Archive](https://archive.org), on podcast sites, and on other sites with plain video or audio. It can also make a site's own Cast player continue to the next episode when it normally stops after one. On **YouTube** it replaces YouTube's queue with its own: videos play in order on your computer, or full-screen in a window your browser casts to the TV, without the TV's YouTube app.
 
 <p align="center"><img src="docs/panel.png" width="380" alt="The Archive Cast panel: now playing, skip and seek controls, and the episode list"></p>
 
@@ -18,7 +18,16 @@ Archive Cast is a Chrome extension. It sends a show's episode files straight to 
   - **Detected streams:** MP4, MP3, HLS and DASH that Chrome actually loads, which catches script-built players. The toolbar badge counts them.
   - **Find next episodes:** follows "Next episode" links to queue the following pages.
   - **Auto-advance:** for sites with their own Cast button that stop after each episode. When the episode ends, Archive Cast opens the next episode page and presses play on the site's player.
+- **YouTube queue:** queue videos from any YouTube page with the + on each video in the panel, **Add all to queue**, or right-click any YouTube link → *Add to Archive Cast queue*. Then play the queue:
+  - **This computer:** a dedicated player tab plays the videos back to back. YouTube's own "autoplay a suggestion" is switched off there, and you control it from the panel on any YouTube tab.
+  - **On TV:** the player opens full-screen in its own window, with no YouTube interface, and your browser casts that tab (**Cast → Cast tab**, once). The TV's YouTube app is never used. The TV shows exactly what your browser plays, so Brave's Shields keep ads off the TV picture too.
+- **Brave:** works the same as in Chrome. If Brave's Google Cast support ("Media Router") is off, which is Brave's default, the panel tells you and opens the right settings page.
 - **Scriptable by AI agents:** the same commands are available as an in-page JS API (`window.ArchiveCast`), an accessible panel with stable `data-ac-action` hooks, an **MCP server** for Claude Code/Desktop, Cursor and other clients, and messaging from other extensions. See [AGENTS.md](AGENTS.md).
+
+<details>
+<summary>On YouTube</summary>
+<p><img src="docs/youtube.png" width="380" alt="The panel on YouTube showing the YouTube queue, with + and ✓ buttons for adding and removing videos"></p>
+</details>
 
 <details>
 <summary>On archive.org</summary>
@@ -36,6 +45,8 @@ Archive Cast isn't in the Chrome Web Store, so you load it as an unpacked extens
 
 It works in Chrome 120+ on Windows, macOS, Linux and ChromeOS. Chromecast support is built into Chrome, so you only need a Chromecast or Google TV on the same network. To update, pull or re-download, then press the reload icon on the extension's card.
 
+**Brave:** the same steps work at `brave://extensions`. Brave also ships with casting switched off. Open **Settings → Extensions**, turn on **Media Router**, and restart Brave. The panel reminds you if it's off.
+
 ## Use it
 
 **archive.org:** open a show, e.g. [Get Smart](https://archive.org/details/get-smart), [Green Acres](https://archive.org/details/GreenAcresCompleteSeries) or the [Gunsmoke radio show](https://archive.org/details/OTRR_Gunsmoke_Singles). Click the round cast button at the bottom right, then click an episode. Chrome asks which Chromecast to use, and that episode plus everything after it goes to the TV.
@@ -46,6 +57,11 @@ It works in Chrome 120+ on Windows, macOS, Linux and ChromeOS. Chromecast suppor
 - **The site already has a Cast button that stops after every episode?** Cast with the site's button as usual and tick **Auto-advance** in the panel. Keep that tab open.
 - **"This site's security policy blocks Google Cast"?** Click **Allow**. Archive Cast relaxes the policy for that one tab only, until it closes, and reloads the page.
 
+**YouTube:** open the panel on any YouTube page.
+- Click a video to play it and everything after it, or use **+** / **Add all to queue** to build your queue. You can also right-click any YouTube link → *Add to Archive Cast queue*.
+- The pill at the top switches between **This computer** and **On TV**. With *On TV*, the player opens in its own full-screen window. From the browser's menu, choose **Cast… → Sources → Cast tab** and pick your TV. In Brave, the menu is ≡ → *Cast…*.
+- Keep using the browser normally while the cast runs; the player window can sit behind your other windows.
+
 The panel's controls work from any page of the site. **Disconnect, keep playing** leaves the Chromecast running, and the toolbar button takes you back to the show later.
 
 ### What can't be cast
@@ -53,6 +69,7 @@ The panel's controls work from any page of the site. **Disconnect, keep playing*
 - DRM-protected services (Netflix, Disney+, …), and sites whose Chromecast app only accepts their own content IDs.
 - HLS/DASH streams on servers that don't send CORS headers: the Chromecast refuses them. Plain MP4/MP3 always works.
 - Links that expire within minutes, or that need your cookies or a specific referrer.
+- YouTube videos as a direct stream: YouTube only serves its videos to its own player. Archive Cast therefore casts YouTube as a tab, with the browser doing the rendering. Expect up to roughly 1080p at 30 fps, and your computer does a little work while it casts.
 
 ## Control it with AI
 
@@ -93,7 +110,8 @@ Archive Cast has no servers, analytics or accounts. Media goes from the website 
 | Read and change data on all websites | Show the panel on the sites you choose, read their feeds and next-episode pages, and notice media files Chrome loads (the badge count). Detected URLs stay in memory for that tab and are cleared when it navigates or closes. |
 | `webRequest` | The stream detector: it reads response headers only and never blocks or changes anything. |
 | `declarativeNetRequestWithHostAccess` | Only when you click **Allow** on a site that blocks Google Cast: removes that page's Content-Security-Policy header for that one tab, until it closes. |
-| `scripting`, `storage`, `alarms` | Show the panel; remember settings, progress and sites; reconnect to the MCP server if you enabled it. |
+| `scripting`, `storage`, `alarms` | Show the panel; remember settings, progress, your YouTube queue and sites; reconnect to the MCP server if you enabled it. |
+| `contextMenus` | The right-click *Add to Archive Cast queue* item on YouTube links. |
 
 Your progress, watched marks and settings live in `chrome.storage` in your browser. MCP and other-extension control are off until you turn them on. The MCP bridge only listens on `127.0.0.1` and refuses connections from web pages.
 
@@ -101,14 +119,17 @@ Your progress, watched marks and settings live in `chrome.storage` in your brows
 
 - **The Cast SDK runs in the page.** It's injected with the page's own CSP nonce, so sites like archive.org that only allow nonce'd scripts still load it. Sites that ship their own Cast player get *shared mode*: Archive Cast leaves their Cast setup alone and runs its own session alongside, or reuses theirs.
 - **The Chromecast does the autoplay.** Episodes are sent to Google's Default Media Receiver as one queue in batches under Cast's 64 KB message limit, so autoplay doesn't depend on the browser. Auto-advance for a site's own player is the exception: that runs in the tab.
+- **YouTube runs in a player tab.** `ytbridge.js` drives YouTube's own player element in one dedicated tab: it loads the next video, seeks, sets the volume, and keeps YouTube's suggestion autoplay away. The service worker owns the queue and tells that tab what to play. TV mode is CSS that makes the player fill its window, so casting the tab sends just the video. youtube.com enforces Trusted Types, so nothing in the page world touches HTML.
 
 ```
 lib/episodes.js   archive.org metadata → ordered, castable episodes
 lib/generic.js    any page: media elements, links, JSON-LD/OpenGraph, feeds, next links, network responses
 lib/commands.js   the command catalog shared by the JS API, extension messaging and MCP
+lib/youtube.js    YouTube links → video IDs; the current video, playlist and other videos on a YouTube page
 castbridge.js     page world: Google Cast SDK, sessions, the receiver queue, window.ArchiveCast
+ytbridge.js       page world on youtube.com: drives YouTube's player in the player tab
 content.js        the panel, site adapters, progress, and the command dispatcher
-background.js     toolbar button, injection, stream detector, routing, MCP bridge client
+background.js     toolbar button, injection, stream detector, YouTube queue + player tab, routing, MCP bridge client
 mcp/server.mjs    MCP server (stdio) + local WebSocket hub + CLI
 ```
 
@@ -119,7 +140,14 @@ npm test                            # unit tests: episode ordering on real archi
 cd test/e2e && npm install && npm test
 ```
 
-The end-to-end suite loads the extension into a throwaway Chrome profile with Puppeteer. It drives a local test site that uses a fake Cast SDK, so queues, skipping, autoplay, the stream detector, next-page following, site-player auto-advance and the MCP bridge are all exercised without a TV. It also checks live archive.org. Set `CHROME=/path/to/chrome` if Chrome isn't in the usual place, or `HEADFUL=1` to watch it run.
+The end-to-end suite loads the extension into a throwaway browser profile with Puppeteer.
+- **Fake Cast site:** a local test site uses a fake Cast SDK, so queues, skipping, autoplay, the stream detector, next-page following, site-player auto-advance and the MCP bridge are all exercised without a TV.
+- **Fake youtube.com:** served over local HTTPS, with a fake player. It covers the YouTube queue, the player tab, TV mode, and keeping YouTube's suggestions out. It needs `openssl` once, to make a throwaway certificate.
+- **Live archive.org** is checked on every run.
+- **Options:**
+  - `CHROME=/path/to/brave` runs everything in Brave.
+  - `LIVE_YOUTUBE=1` adds a smoke test against the real youtube.com.
+  - `HEADFUL=1` lets you watch it run.
 
 When you edit the extension, reload it from `chrome://extensions`, or call the `reload_extension` tool if the MCP bridge is on.
 

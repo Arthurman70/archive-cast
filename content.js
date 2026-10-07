@@ -20,6 +20,11 @@
   const COLLECTION_LIMIT = 150;
   const RECENT_CAST_MS = 12 * 3600 * 1000;
   const IS_ARCHIVE = /^(www\.)?archive\.org$/.test(location.hostname); // not web.archive.org (Wayback)
+  const IS_YOUTUBE = /^(www\.|m\.)?youtube\.com$/.test(location.hostname);
+  const IS_BRAVE = !!(navigator.brave && navigator.brave.isBrave);
+  const YTL = globalThis.ArchiveCastYouTube;
+  const YT_CMD = 'archive-cast:yt-cmd';
+  const YT_EVT = 'archive-cast:yt-evt';
   const ORIGIN_KEY = IS_ARCHIVE ? '' : ':' + location.origin;
 
   const send = (cmd, data) => window.postMessage(Object.assign({ [CMD]: true, cmd }, data || {}), location.origin);
@@ -63,6 +68,12 @@
     autoAdvance: false,
     siteWatch: null,
     advancing: false,
+    // YouTube
+    ytTarget: 'computer', // where the YouTube queue plays: computer | tv
+    yt: null, // playback snapshot from the service worker
+    ytQueue: [],
+    isPlayer: false, // this tab is the YouTube player tab
+    tv: false,
     // shared
     settings: { mode: 'best', loop: false },
     cast: null,
@@ -380,6 +391,145 @@
     toast('I opened the next episode but couldn’t start this site’s player — press play on the page.', 'warn');
   }
 
+  // ================================================================= YouTube
+  // The queue and playback live in the service worker. Videos play in one dedicated youtube.com
+  // tab (the player tab, driven through ytbridge.js); every other YouTube tab shows the same
+  // queue and remote-controls that player. For a TV, the player tab goes full-bleed and the
+  // browser casts the tab, so the TV's YouTube app is never used.
+  const ytEp = (v) => ({
+    key: v.id, id: 'yt', file: v.id, url: YTL.watchUrl(v.id), mime: 'video/youtube', kind: 'video',
+    title: v.title || v.id, folder: '', duration: v.duration || null, track: NaN, format: 'YouTube',
+    show: v.channel || 'YouTube', creator: v.channel || '', channel: v.channel || '', image: YTL.thumbUrl(v.id), alts: [v.id],
+  });
+  const ytVideo = (e) => ({ id: e.file, title: e.title, channel: e.channel || null, duration: e.duration || null });
+
+  async function loadYouTube() {
+    S.pageId = 'yt'; // watched marks and the resume spot are shared across all of YouTube
+    resetLists();
+    S.status = 'loading';
+    S.statusText = 'Looking for videos…';
+    render();
+    await loadMemory();
+    await rescanYouTube();
+  }
+
+  async function rescanYouTube() {
+    const before = S.status === 'ready' ? listsSignature() : null;
+    const scan = YTL.scanDocument(document, location.href);
+    setList('ytqueue', 'My queue', S.ytQueue.map(ytEp), false);
+    setList('playlist', scan.playlist ? 'Playlist: ' + scan.playlist.title : 'Playlist', scan.playlist ? scan.playlist.items.map(ytEp) : [], false);
+    setList('page', 'On this page', (scan.current ? [scan.current] : []).concat(scan.page).map(ytEp), false);
+    if (before !== null && before === listsSignature()) return;
+    S.status = 'ready';
+    pickSource();
+    setEps();
+    render();
+  }
+
+  function onYtUpdate(yt, queue) {
+    S.yt = yt;
+    if (Array.isArray(queue)) {
+      const changed = JSON.stringify(queue.map((v) => v.id + v.title)) !== JSON.stringify(S.ytQueue.map((v) => v.id + v.title));
+      S.ytQueue = queue;
+      if (changed && IS_YOUTUBE && S.status === 'ready') {
+        setList('ytqueue', 'My queue', queue.map(ytEp), false);
+        pickSource();
+        setEps();
+        render();
+      }
+    }
+    if (IS_YOUTUBE) onCastState(ytToCast(yt));
+  }
+
+  // Present the YouTube player like a Cast session so the panel, progress and API work unchanged.
+  function ytToCast(yt) {
+    const active = !!(yt && yt.active && yt.items.length);
+    const cur = active ? yt.items[yt.index] : null;
+    const st = active ? yt.status : null;
+    let media = null;
+    if (active && yt.finished) media = { playerState: 'IDLE', idleReason: 'FINISHED', time: null, duration: null };
+    else if (active && cur) {
+      const ours = st && st.ready && st.videoId === cur.id;
+      const state = !ours ? 'BUFFERING' : st.state === 'ENDED' ? 'BUFFERING' : st.state;
+      media = {
+        playerState: state, idleReason: null, time: ours ? st.time : 0, duration: (ours && st.duration) || cur.duration || null,
+        url: YTL.watchUrl(cur.id), custom: { id: 'yt', f: cur.id }, title: cur.title, subtitle: cur.channel || 'YouTube',
+      };
+    }
+    return {
+      sdk: 'ready', sdkError: null, mode: 'youtube', castState: active ? 'CONNECTED' : 'NOT_CONNECTED',
+      device: S.ytTarget === 'tv' ? 'TV (cast the player tab)' : 'This computer',
+      volume: st ? st.volume : null, muted: st ? st.muted : null, loading: false, site: null, media,
+    };
+  }
+
+  function ytCall(action, data) {
+    return bg('yt', Object.assign({ action }, data)).then((r) => {
+      if (r && r.ok === false) throw new Error(r.error);
+      if (r && r.yt) onYtUpdate(r.yt, r.queue);
+      return r;
+    });
+  }
+
+  function setYtTarget(target) {
+    S.ytTarget = target;
+    store.set('ac:ytTarget', target);
+    ytCall('target', { target }).catch(() => {});
+    if (target === 'tv') castTabHint();
+    render();
+  }
+
+  // Brave/Chrome cast a tab from their own menu; there is no API to start it for the user.
+  function castTabHint() {
+    const how = IS_BRAVE
+      ? 'In the player window, open Brave’s menu (≡) → Cast… → Sources → Cast tab, and pick your TV.'
+      : 'In the player window, open Chrome’s menu (⋮) → Cast, save, and share → Cast… → Sources → Cast tab, and pick your TV.';
+    toast('TV mode: the player opens full-screen in its own window. ' + how + ' Keep using the browser — the cast keeps going.', 'info', {
+      label: 'Show player', run: () => ytCall('show').catch((e) => toast(e.message, 'warn')),
+    });
+  }
+
+  // ---- this tab is the player -----------------------------------------------------
+  const ysend = (cmd, data) => window.postMessage(Object.assign({ [YT_CMD]: true, cmd }, data || {}), location.origin);
+
+  const TV_CSS = `
+html.ac-tv, html.ac-tv body { background: #000 !important; overflow: hidden !important; }
+html.ac-tv #masthead-container, html.ac-tv ytd-masthead, html.ac-tv #secondary, html.ac-tv #below, html.ac-tv ytd-comments,
+html.ac-tv #chat, html.ac-tv tp-yt-app-drawer, html.ac-tv ytd-mini-guide-renderer, html.ac-tv #guide { display: none !important; }
+html.ac-tv #movie_player { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; z-index: 2147482000 !important; background: #000 !important; }
+html.ac-tv #movie_player .html5-video-container, html.ac-tv #movie_player video { width: 100vw !important; height: 100vh !important; left: 0 !important; top: 0 !important; object-fit: contain !important; }
+html.ac-tv .ytp-chrome-top, html.ac-tv .ytp-chrome-bottom, html.ac-tv .ytp-gradient-top, html.ac-tv .ytp-gradient-bottom,
+html.ac-tv .ytp-ce-element, html.ac-tv .ytp-pause-overlay, html.ac-tv .ytp-endscreen-content, html.ac-tv .ytp-autonav-endscreen,
+html.ac-tv .iv-branding, html.ac-tv .ytp-paid-content-overlay, html.ac-tv .ytp-cards-teaser { display: none !important; }
+html.ac-tv, html.ac-tv * { cursor: none !important; }`;
+
+  function setTv(on) {
+    S.tv = !!on;
+    if (S.tv && !document.getElementById('archive-cast-tv-style')) {
+      const style = document.createElement('style');
+      style.id = 'archive-cast-tv-style';
+      style.textContent = TV_CSS;
+      (document.head || document.documentElement).appendChild(style);
+    }
+    document.documentElement.classList.toggle('ac-tv', S.tv);
+    setTimeout(() => ysend('resize'), 50);
+    render();
+  }
+
+  function startPlayer(hello) {
+    S.isPlayer = true;
+    setTv(hello.tv);
+    ysend('activate');
+    if (hello.current) ysend('load', { id: hello.current.id });
+  }
+
+  window.addEventListener('message', (ev) => {
+    if (!S.isPlayer || ev.source !== window || !ev.data || ev.data[YT_EVT] !== true) return;
+    const d = ev.data;
+    if (d.type === 'state') bg('yt', { action: 'status', status: d.state });
+    else if (d.type === 'error') bg('yt', { action: 'error', code: d.code, videoId: d.videoId });
+  });
+
   // ================================================================= lists
   function resetLists() {
     S.lists = {};
@@ -389,7 +539,7 @@
     setEps();
   }
 
-  const SOURCE_ORDER = ['video', 'audio', 'custom', 'feed', 'follow', 'page', 'streams'];
+  const SOURCE_ORDER = ['video', 'audio', 'ytqueue', 'playlist', 'custom', 'feed', 'follow', 'page', 'streams'];
 
   function setList(id, label, eps, repick) {
     S.lists[id] = eps;
@@ -401,6 +551,10 @@
   function pickSource() {
     const has = (id) => (S.lists[id] || []).length > 0;
     if (S.source && has(S.source) && S.sourcePinned) return;
+    if (IS_YOUTUBE) { // a playlist you opened, else your queue, else what's on the page — but never jump away mid-use
+      if (!(S.source && has(S.source))) S.source = ['playlist', 'ytqueue', 'page'].find(has) || null;
+      return;
+    }
     let best = null;
     for (const id of SOURCE_ORDER) if (has(id) && (!best || S.lists[id].length > S.lists[best].length)) best = id;
     if (best) S.source = best;
@@ -411,7 +565,7 @@
   function setEps() {
     S.eps = (S.source && S.lists[S.source]) || [];
     S.fileIndex = new Map();
-    const prefix = commonPrefix(S.eps.map((e) => e.title));
+    const prefix = IS_YOUTUBE ? '' : commonPrefix(S.eps.map((e) => e.title)); // YouTube titles are free-form
     S.eps.forEach((ep, i) => {
       ep.uid = ep.id + '/' + ep.key;
       ep.short = ep.title.slice(prefix.length) || ep.title;
@@ -465,9 +619,17 @@
 
   // ================================================================= casting
   function ensureSdk() {
-    if (S.sdkRequested) return;
+    if (S.sdkRequested || IS_YOUTUBE) return; // YouTube plays through the player tab, not the Cast SDK
     S.sdkRequested = true;
     send('init', { own: IS_ARCHIVE });
+  }
+
+  // Transport commands go to the Chromecast — or, on YouTube, to the YouTube player tab.
+  const YT_ACTIONS = { disconnect: 'stop', repeat: null };
+  function transport(cmd, data) {
+    if (!IS_YOUTUBE) return send(cmd, data);
+    const action = cmd in YT_ACTIONS ? YT_ACTIONS[cmd] : cmd;
+    if (action) ytCall(action, data).catch((e) => toast(e.message, 'warn'));
   }
 
   const slim = (e) => ({
@@ -484,6 +646,7 @@
 
   function loadFrom(i, startTime) {
     if (i < 0 || i >= S.eps.length) return;
+    if (IS_YOUTUBE) return ytStart(i, startTime);
     ensureSdk();
     setPending(i);
     send('load', {
@@ -496,8 +659,24 @@
     renderList();
   }
 
+  function ytStart(i, startTime) {
+    setPending(i);
+    // don't let this tab's own video play over the queue
+    if (!S.isPlayer) for (const v of document.querySelectorAll('video')) { try { v.pause(); } catch (_) { /* ignore */ } }
+    ytCall('play', { videos: S.eps.map(ytVideo), index: i, startTime: startTime || 0, target: S.ytTarget, listKey: S.source })
+      .catch((e) => { setPending(null); toast(e.message, 'error'); });
+    renderList();
+  }
+
   function playEpisode(i, startTime) {
     if (i < 0 || i >= S.eps.length) return;
+    if (IS_YOUTUBE) {
+      const yt = S.yt;
+      const same = yt && yt.active && !startTime && yt.items.length === S.eps.length && yt.items.every((v, n) => v.id === S.eps[n].file);
+      if (same) { setPending(i); ytCall('jump', { index: i }).catch((e) => toast(e.message, 'warn')); renderList(); }
+      else ytStart(i, startTime);
+      return;
+    }
     const m = S.cast && S.cast.media;
     if (!startTime && m && m.playerState !== 'IDLE' && indexOfMedia(m) >= 0) {
       setPending(i);
@@ -511,6 +690,7 @@
   }
 
   function navigate(dir) {
+    if (IS_YOUTUBE) return ytCall(dir > 0 ? 'next' : 'previous').catch((e) => toast(e.message, 'warn'));
     // the receiver's own queue is fastest; castbridge reports navMiss and we reload from the neighbour
     if (S.cast && S.cast.media) send(dir > 0 ? 'next' : 'prev');
   }
@@ -528,7 +708,7 @@
   function onCastState(st) {
     S.cast = st;
     const now = Date.now();
-    if ((st.castState === 'CONNECTED' || (st.site && st.site.connected)) && now - S.castingSavedAt > 60000) {
+    if (!IS_YOUTUBE && (st.castState === 'CONNECTED' || (st.site && st.site.connected)) && now - S.castingSavedAt > 60000) {
       S.castingSavedAt = now;
       store.set('ac:castingAt' + ORIGIN_KEY, now);
     }
@@ -536,9 +716,11 @@
     const i = indexOfMedia(m);
     if (i >= 0) {
       if (S.pending === i && m.playerState !== 'IDLE') setPending(null);
-      track(i, m);
+      if (!IS_YOUTUBE) track(i, m);
     }
-    handlePlaybackError(i, m);
+    // YouTube: only the player tab records progress (other tabs may show different lists)
+    if (IS_YOUTUBE && S.isPlayer && m && m.custom) trackYt(m);
+    if (!IS_YOUTUBE) handlePlaybackError(i, m); // the YouTube player skips broken videos itself
     watchSite(st);
     for (const w of [...S.waiters]) w.check();
     renderNow();
@@ -560,6 +742,20 @@
       S.progress = { uid: ep.uid, title: ep.title, time: m.time || 0, at: now };
       store.set('ac:p:' + S.pageId, S.progress);
       if (IS_ARCHIVE) store.set('ac:last', S.pageId);
+    }
+  }
+
+  function trackYt(m) {
+    const uid = 'yt/' + m.custom.f;
+    if (m.duration && m.time / m.duration > 0.9 && !S.watched.has(uid)) {
+      S.watched.add(uid);
+      store.set('ac:w:yt', [...S.watched].slice(-2000));
+    }
+    const now = Date.now();
+    if (m.playerState === 'PLAYING' && (uid !== S.lastUid || now - S.lastSavedAt > 10000)) {
+      S.lastUid = uid;
+      S.lastSavedAt = now;
+      store.set('ac:p:yt', { uid, title: m.title, time: m.time || 0, at: now });
     }
   }
 
@@ -591,7 +787,7 @@
   function setLoop(on) {
     S.settings.loop = !!on;
     store.set('ac:settings', S.settings);
-    send('repeat', { on: S.settings.loop });
+    transport('repeat', { on: S.settings.loop });
     render();
   }
 
@@ -645,6 +841,7 @@
   }
 
   async function requireCast() {
+    if (IS_YOUTUBE) return; // the YouTube player tab needs no device connection
     ensureSdk();
     if (!canCast()) {
       send('init', { own: IS_ARCHIVE }); // asks the bridge for a fresh state (e.g. a site session that just connected)
@@ -693,6 +890,13 @@
       sitePlayer: st.site || null,
       settings: { quality: S.settings.mode, loop: S.settings.loop, autoAdvance: S.autoAdvance },
       nextPageUrl: S.nextUrl,
+      youtube: IS_YOUTUBE ? {
+        target: S.ytTarget, playerActive: !!(S.yt && S.yt.active), isPlayerTab: S.isPlayer, tvMode: S.tv,
+        queueLength: S.ytQueue.length, playingIndex: S.yt && S.yt.active ? S.yt.index : null,
+        playingList: S.yt && S.yt.active ? S.yt.items.length : null, finished: !!(S.yt && S.yt.finished),
+        lastError: (S.yt && S.yt.lastError) || null,
+      } : undefined,
+      browser: IS_BRAVE ? 'brave' : 'chrome',
       resume: (() => { const r = resumeTarget(); return r ? { index: r.i, title: S.eps[r.i].title, time: Math.round(r.time) } : null; })(),
       panelOpen: S.open,
     };
@@ -720,7 +924,7 @@
 
   const api = {
     async help() {
-      return COMMANDS.COMMANDS.filter((c) => c.scope === 'tab').map((c) => ({
+      return COMMANDS.COMMANDS.filter((c) => c.scope === 'tab' || (IS_YOUTUBE && /^youtube/.test(c.name))).map((c) => ({
         name: c.name, description: c.description, args: Object.keys(c.args).filter((a) => a !== 'tabId'),
       }));
     },
@@ -749,30 +953,30 @@
     async resume() {
       await ready;
       const m = S.cast && S.cast.media;
-      if (isActive(m)) { send('play'); return waitFor(() => S.cast.media && S.cast.media.playerState !== 'PAUSED', 5000); }
+      if (isActive(m)) { transport('play'); return waitFor(() => S.cast.media && S.cast.media.playerState !== 'PAUSED', 5000); }
       const r = resumeTarget();
       if (!r) throw new Error('Nothing is playing and there is no saved spot for this page.');
       return api.play({ index: r.i, startTime: r.time });
     },
-    async pause() { requireMedia(); send('pause'); return waitFor(() => S.cast.media && S.cast.media.playerState === 'PAUSED', 5000); },
-    async toggle() { requireMedia(); send('toggle'); await sleep(800); return publicState(); },
+    async pause() { requireMedia(); transport('pause'); return waitFor(() => S.cast.media && S.cast.media.playerState === 'PAUSED', 5000); },
+    async toggle() { requireMedia(); transport('toggle'); await sleep(800); return publicState(); },
     async next() { return step(1); },
     async previous() { return step(-1); },
     async seek({ time, delta } = {}) {
       requireMedia();
       if (time == null && delta == null) throw new Error('Give "time" (seconds) or "delta" (relative seconds).');
-      send('seek', delta != null ? { delta: +delta } : { time: +time });
+      transport('seek', delta != null ? { delta: +delta } : { time: +time });
       await sleep(1200);
       return publicState();
     },
     async volume({ level } = {}) {
       await requireCast();
       if (!(level >= 0 && level <= 1)) throw new Error('level must be between 0 and 1.');
-      send('volume', { level: +level });
+      transport('volume', { level: +level });
       await sleep(800);
       return publicState();
     },
-    async mute({ muted = true } = {}) { await requireCast(); send('mute', { muted: !!muted }); await sleep(800); return publicState(); },
+    async mute({ muted = true } = {}) { await requireCast(); transport('mute', { muted: !!muted }); await sleep(800); return publicState(); },
     async loop({ on = true } = {}) { setLoop(on); return publicState(); },
     async quality({ mode } = {}) {
       if (!['best', 'compat'].includes(mode)) throw new Error('mode must be "best" or "compat".');
@@ -790,6 +994,7 @@
     },
     async castMedia({ items, startIndex = 0 } = {}) {
       await ready;
+      if (IS_YOUTUBE) throw new Error('On YouTube use youtubePlay / youtubeAdd. castMedia is for direct media files on other sites.');
       if (!Array.isArray(items) || !items.length) throw new Error('items must be a non-empty array of {url, title}.');
       const show = IS_ARCHIVE ? 'Archive Cast' : siteName();
       const eps = items.map((it, n) => {
@@ -806,18 +1011,21 @@
     },
     async findMore({ maxPages } = {}) { await ready; return findMore(maxPages); },
     async autoAdvance({ on = true } = {}) {
-      if (IS_ARCHIVE) throw new Error('Not needed on archive.org — the Chromecast queue already autoplays.');
+      if (IS_ARCHIVE || IS_YOUTUBE) throw new Error('Not needed here — this queue already autoplays.');
       setAutoAdvance(on);
       return publicState();
     },
     async rescan() {
       await ready;
-      if (IS_ARCHIVE) await loadArchive(); else await rescanWeb();
+      if (IS_ARCHIVE) await loadArchive();
+      else if (IS_YOUTUBE) await rescanYouTube();
+      else await rescanWeb();
       return publicState();
     },
     async openPanel() { setOpen(true); return publicState(); },
     async closePanel() { setOpen(false); return publicState(); },
     async connect() {
+      if (IS_YOUTUBE) return Object.assign(publicState(), { note: 'YouTube plays in Archive Cast’s player tab: nothing to connect. For a TV, use youtubePlay with target "tv", then cast that tab from the browser menu.' });
       ensureSdk();
       if (canCast()) return publicState();
       send('connect');
@@ -827,7 +1035,7 @@
       });
     },
     async stop({ keepPlaying = false } = {}) {
-      send('disconnect', { stop: !keepPlaying });
+      transport('disconnect', { stop: !keepPlaying });
       return waitFor(() => !canCast() || (S.cast.site && S.cast.site.connected && !S.cast.media), 4000);
     },
   };
@@ -844,6 +1052,13 @@
   }
 
   async function runApi(cmd, args) {
+    if (IS_YOUTUBE && /^youtube[A-Z]/.test(cmd || '')) {
+      // the YouTube queue lives in the service worker
+      const r = await bg('api', { cmd, args: args || {} });
+      if (!r) throw new Error('Archive Cast’s service worker did not answer.');
+      if (!r.ok) throw new Error(r.error);
+      return r.result;
+    }
     const fn = Object.prototype.hasOwnProperty.call(api, cmd) && api[cmd];
     if (!fn) throw new Error(`Unknown command “${cmd}”. Call help for the list.`);
     return fn(args || {});
@@ -869,6 +1084,10 @@
     close: 'M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
     check: 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
     more: 'M4 6h12v2H4zm0 5h12v2H4zm0 5h8v2H4zm12 0v-3l5 4-5 4v-3z',
+    plus: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z',
+    queue: 'M3 6h12v2H3zm0 5h12v2H3zm0 5h8v2H3zm14-5v-3h2v3h3v2h-3v3h-2v-3h-3v-2z',
+    tv: 'M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z',
+    computer: 'M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z',
   };
   const svg = (name, cls) =>
     `<svg class="ic ${cls || ''}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON[name]}"/></svg>`;
@@ -967,6 +1186,7 @@ label.chk input { accent-color: var(--accent); margin: 0; }
 .btn span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .btn .ic { width: 16px; height: 16px; }
 .btn.primary { background: var(--accent); color: var(--accent-ink); }
+.btn.sq { flex: none; width: 38px; padding: 9px 0; }
 .btn:not(:disabled):hover { filter: brightness(1.12); }
 .filter { margin: 10px 12px 6px; }
 .filter input { width: 100%; font: inherit; color: var(--fg); background: var(--bg2); border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; outline: none; }
@@ -983,6 +1203,10 @@ label.chk input { accent-color: var(--accent); margin: 0; }
 .ep .s { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--fg3); font-size: 11px; }
 .ep .d { color: var(--fg3); font-size: 11px; font-variant-numeric: tabular-nums; flex: none; }
 .ep .w { width: 14px; height: 14px; color: var(--ok); fill: currentColor; flex: none; }
+.ep .rowbtn { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; color: var(--fg3); flex: none; }
+.ep .rowbtn:hover { background: var(--bg3); color: var(--fg); }
+.ep .rowbtn.in { color: var(--accent); }
+.ep .rowbtn .ic { width: 16px; height: 16px; }
 .ep.watched .t { color: var(--fg2); }
 .ep.now { background: rgba(90,169,255,.14); }
 .ep.now .t, .ep.now .num { color: var(--accent); font-weight: 650; }
@@ -1040,11 +1264,14 @@ footer .btn:hover { color: var(--fg); }
       ${b('btn primary playall', 'play-all', 'Play all from the start', svg('play') + '<span>Play all from the start</span>')}
       ${b('btn resume', 'resume', 'Resume', svg('replay') + '<span></span>', ' hidden')}
       ${b('btn more', 'find-more', 'Follow next-episode links to queue the following episodes', svg('more') + '<span>Find next episodes</span>', ' hidden')}
+      ${b('btn qall', 'queue-all', 'Add every video in this list to your queue', svg('queue') + '<span>Add all to queue</span>', ' hidden')}
+      ${b('btn sq qclear', 'queue-clear', 'Clear queue: remove every video', svg('close'), ' hidden')}
     </div>
     <div class="filter"><input type="search" data-ac-action="filter" placeholder="Find an episode…" aria-label="Filter episodes"></div>
     <ol class="list" aria-label="Episodes"></ol>
     <footer hidden>
       ${b('btn leave', 'disconnect', 'Close this connection; the Chromecast keeps playing', 'Disconnect, keep playing')}
+      ${b('btn showp', 'show-player', 'Bring the YouTube player tab to the front', 'Show player', ' hidden')}
       ${b('btn stop', 'stop', 'Stop playback on the Chromecast', 'Stop casting')}
     </footer>
   </section>
@@ -1057,21 +1284,32 @@ footer .btn:hover { color: var(--fg); }
       mute: q('.mute'), vol: q('.volbar'), msg: q('.msg'), msgAct: q('.msg .act'), count: q('.count'), source: q('.source'),
       sort: q('.sort'), mode: q('.mode'), loop: q('.loop'), aa: q('.aabox'), playall: q('.playall'), resume: q('.resume'),
       more: q('.more'), filter: q('.filter input'), list: q('.list'), footer: q('footer'), leave: q('.leave'), stop: q('.stop'),
+      qall: q('.qall'), qclear: q('.qclear'), showp: q('.showp'),
     };
 
     $.launcher.addEventListener('click', () => setOpen(true));
     $.close.addEventListener('click', () => setOpen(false));
-    $.device.addEventListener('click', () => { ensureSdk(); send('connect'); });
-    $.play.addEventListener('click', () => send('toggle'));
-    $.back.addEventListener('click', () => send('seek', { delta: -10 }));
-    $.fwd.addEventListener('click', () => send('seek', { delta: 30 }));
+    $.device.addEventListener('click', () => {
+      if (IS_YOUTUBE) return setYtTarget(S.ytTarget === 'tv' ? 'computer' : 'tv');
+      ensureSdk();
+      send('connect');
+    });
+    $.qall.addEventListener('click', () => {
+      ytCall('queueAdd', { videos: S.eps.map(ytVideo) })
+        .then((r) => toast(`Added ${r.added.length} video${r.added.length === 1 ? '' : 's'} to your queue.`, 'info'), (e) => toast(e.message, 'warn'));
+    });
+    $.qclear.addEventListener('click', () => ytCall('queueClear').catch((e) => toast(e.message, 'warn')));
+    $.showp.addEventListener('click', () => ytCall('show').catch((e) => toast(e.message, 'warn')));
+    $.play.addEventListener('click', () => transport('toggle'));
+    $.back.addEventListener('click', () => transport('seek', { delta: -10 }));
+    $.fwd.addEventListener('click', () => transport('seek', { delta: 30 }));
     $.prev.addEventListener('click', () => navigate(-1));
     $.nextBtn.addEventListener('click', () => navigate(1));
     $.bar.addEventListener('pointerdown', () => { S.seeking = true; });
     $.bar.addEventListener('input', () => { $.cur.textContent = fmtTime(+$.bar.value); paintRange($.bar); });
-    $.bar.addEventListener('change', () => { S.seeking = false; send('seek', { time: +$.bar.value }); });
-    $.vol.addEventListener('input', () => { paintRange($.vol); send('volume', { level: $.vol.value / 100 }); });
-    $.mute.addEventListener('click', () => send('mute', { muted: !(S.cast && S.cast.muted) }));
+    $.bar.addEventListener('change', () => { S.seeking = false; transport('seek', { time: +$.bar.value }); });
+    $.vol.addEventListener('input', () => { paintRange($.vol); transport('volume', { level: $.vol.value / 100 }); });
+    $.mute.addEventListener('click', () => transport('mute', { muted: !(S.cast && S.cast.muted) }));
     $.msg.querySelector('.x').addEventListener('click', () => { $.msg.hidden = true; });
     $.msgAct.addEventListener('click', () => { const fn = $.msgAct._fn; $.msg.hidden = true; if (fn) fn(); });
     $.source.addEventListener('change', () => { S.source = $.source.value; S.sourcePinned = true; setEps(); render(); });
@@ -1091,16 +1329,26 @@ footer .btn:hover { color: var(--fg); }
     $.filter.addEventListener('input', applyFilter);
     $.list.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-ac-action="rescan"]');
-      if (btn) { rescanWeb(); return; }
+      if (btn) { if (IS_YOUTUBE) rescanYouTube(); else rescanWeb(); return; }
+      const row = e.target.closest('.rowbtn');
+      if (row) {
+        e.stopPropagation();
+        const ep = S.eps[+row.dataset.i];
+        const qi = S.ytQueue.findIndex((v) => v.id === ep.file);
+        if (qi >= 0) ytCall('queueRemove', { index: qi }).catch((err) => toast(err.message, 'warn'));
+        else ytCall('queueAdd', { videos: [ytVideo(ep)] }).catch((err) => toast(err.message, 'warn'));
+        return;
+      }
       const li = e.target.closest('.ep');
       if (li) playEpisode(+li.dataset.i, 0);
     });
     $.list.addEventListener('keydown', (e) => {
+      if (e.target.closest('.rowbtn')) return; // its own click handles Enter/Space
       const li = e.target.closest('.ep');
       if (li && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); playEpisode(+li.dataset.i, 0); }
     });
-    $.leave.addEventListener('click', () => send('disconnect', { stop: false }));
-    $.stop.addEventListener('click', () => send('disconnect', { stop: true }));
+    $.leave.addEventListener('click', () => transport('disconnect', { stop: false }));
+    $.stop.addEventListener('click', () => transport('disconnect', { stop: true }));
 
     (document.body || document.documentElement).appendChild(host);
   }
@@ -1133,7 +1381,8 @@ footer .btn:hover { color: var(--fg); }
     if (open) {
       ensureSdk();
       if (S.isCollection) resolveCollection();
-      if (!IS_ARCHIVE) rescanWeb();
+      if (IS_YOUTUBE) rescanYouTube();
+      else if (!IS_ARCHIVE) rescanWeb();
     }
     render();
     publish();
@@ -1162,7 +1411,7 @@ footer .btn:hover { color: var(--fg); }
     publish();
     const hasContent = S.status === 'collection' || (S.status === 'ready' && S.eps.length > 0);
     const live = !!(S.cast && (S.cast.castState === 'CONNECTED' || (S.cast.site && S.cast.site.connected && S.autoAdvance)));
-    $.launcher.hidden = S.open || !(hasContent || live);
+    $.launcher.hidden = S.open || S.tv || !(hasContent || live); // never on the TV picture
     $.launcher.classList.toggle('live', live);
     $.panel.hidden = !S.open;
     if (!S.open) return;
@@ -1178,14 +1427,40 @@ footer .btn:hover { color: var(--fg); }
   }
 
   let csrOffered = false;
+  let braveHinted = false;
+  function renderYtDevice(connected) {
+    const tv = S.ytTarget === 'tv';
+    setHTML($.device, svg(tv ? 'tv' : 'computer') + `<span>${tv ? 'On TV' : 'This computer'}</span>`);
+    $.device.classList.toggle('on', connected);
+    $.device.disabled = false;
+    const tip = `YouTube plays ${tv ? 'full-screen in its own window, for casting that tab to your TV' : 'in a tab on this computer'}. Click to switch.`;
+    $.device.title = tip;
+    $.device.setAttribute('aria-label', tip);
+    $.footer.hidden = !connected;
+    $.leave.hidden = true;
+    $.showp.hidden = false;
+    $.stop.textContent = 'Stop';
+    $.stop.title = 'Stop and close the player tab';
+  }
+
   function renderNow() {
     if (!$ || !S.open) return;
     const st = S.cast;
     const m = st && st.media;
     const connected = !!(st && st.castState === 'CONNECTED');
 
+    // Brave ships Google Cast switched off ("Media Router" in Settings → Extensions)
+    if (IS_BRAVE && !IS_YOUTUBE && st && !braveHinted && (st.sdk === 'unavailable' || st.castState === 'NO_DEVICES_AVAILABLE')) {
+      braveHinted = true;
+      toast('No Chromecast found. Brave turns casting off by default: open Brave Settings → Extensions, switch on “Media Router”, then restart Brave.', 'warn', {
+        label: 'Open settings', run: () => bg('openSettings'),
+      });
+    }
+
     // device pill
     let label = 'Connect', on = false, disabled = false;
+    if (IS_YOUTUBE) renderYtDevice(connected);
+    else {
     if (!st || st.sdk === 'loading' || st.sdk === 'idle') { label = 'Starting…'; disabled = !!st; }
     else if (st.sdk === 'unavailable' || st.sdk === 'blocked') { label = 'Cast unavailable'; disabled = true; }
     else if (connected) { label = st.device || 'Connected'; on = true; }
@@ -1198,6 +1473,7 @@ footer .btn:hover { color: var(--fg); }
     $.device.title = tip;
     $.device.setAttribute('aria-label', tip);
     $.footer.hidden = !connected;
+    }
 
     if (st && st.sdk === 'blocked' && !csrOffered) {
       csrOffered = true;
@@ -1225,6 +1501,12 @@ footer .btn:hover { color: var(--fg); }
       $.title.textContent = site.media.title || 'Casting with this site’s player';
       $.sub.textContent = `This site’s player · ${site.device || 'Chromecast'}`;
       $.next.textContent = S.autoAdvance ? (S.nextUrl ? 'Auto-advance is on — the next episode opens when this one ends.' : 'Auto-advance is on, but there’s no next-episode link here.') : '';
+    } else if (IS_YOUTUBE) {
+      $.title.textContent = 'Nothing playing';
+      $.sub.textContent = S.ytTarget === 'tv'
+        ? 'Click a video: it plays full-screen in its own window, ready to cast to your TV.'
+        : 'Click a video to play from there, or + to queue it.';
+      $.next.textContent = '';
     } else {
       $.title.textContent = connected ? 'Pick an episode to start' : st && st.sdkError ? 'Cast unavailable' : 'Nothing casting';
       $.sub.textContent = connected ? 'Connected to ' + st.device
@@ -1261,7 +1543,7 @@ footer .btn:hover { color: var(--fg); }
     let count = '';
     if (S.crawling) count = S.crawlText;
     else if (S.status === 'ready' && n) {
-      count = `${n} episode${n === 1 ? '' : 's'}`;
+      count = `${n} ${IS_YOUTUBE ? 'video' : 'episode'}${n === 1 ? '' : 's'}`;
       if (S.isCollection && S.raw.total > COLLECTION_LIMIT) count += ` · first ${COLLECTION_LIMIT} of ${S.raw.total} items`;
     }
     $.count.textContent = count;
@@ -1279,10 +1561,12 @@ footer .btn:hover { color: var(--fg); }
     $.playall.hidden = !ready;
     $.mode.hidden = !ready || !IS_ARCHIVE;
     $.loop.parentElement.hidden = !ready;
-    $.aa.parentElement.hidden = IS_ARCHIVE || !(S.nextUrl || (S.cast && S.cast.site && S.cast.site.connected));
-    $.more.hidden = IS_ARCHIVE || !S.nextUrl || S.source === 'follow';
+    $.aa.parentElement.hidden = IS_ARCHIVE || IS_YOUTUBE || !(S.nextUrl || (S.cast && S.cast.site && S.cast.site.connected));
+    $.more.hidden = IS_ARCHIVE || IS_YOUTUBE || !S.nextUrl || S.source === 'follow';
     $.more.disabled = S.crawling;
-    $.playall.parentElement.hidden = $.playall.hidden && $.more.hidden;
+    $.qall.hidden = !IS_YOUTUBE || !ready || S.source === 'ytqueue';
+    $.qclear.hidden = !IS_YOUTUBE || !ready || S.source !== 'ytqueue';
+    $.playall.parentElement.hidden = $.playall.hidden && $.more.hidden && $.qall.hidden && $.qclear.hidden;
     $.filter.parentElement.hidden = !ready || n < 8;
     const r = ready ? resumeTarget() : null;
     const i = currentIndex();
@@ -1307,8 +1591,10 @@ footer .btn:hover { color: var(--fg); }
       S.scrolledTo = null;
     }
     const cur = currentIndex();
+    const queued = IS_YOUTUBE ? new Set(S.ytQueue.map((v) => v.id)) : null;
     for (const li of $.list.querySelectorAll('.ep')) {
       const i = +li.dataset.i;
+      if (queued) paintRowButton(li.querySelector('.rowbtn'), S.eps[i], queued.has(S.eps[i].file));
       const now = i === cur;
       if (li.classList.contains('now') !== now) {
         li.classList.toggle('now', now);
@@ -1345,6 +1631,8 @@ footer .btn:hover { color: var(--fg); }
       if (IS_ARCHIVE) {
         const clean = EP.cleanName(ep.file);
         sub = clean.toLowerCase() !== ep.title.toLowerCase() ? clean : '';
+      } else if (IS_YOUTUBE) {
+        sub = ep.channel;
       } else {
         let host = '';
         try { host = new URL(ep.url).hostname.replace(/^www\./, ''); } catch (_) { /* ignore */ }
@@ -1352,9 +1640,22 @@ footer .btn:hover { color: var(--fg); }
       }
       html += `<li class="ep" role="button" tabindex="0" data-i="${i}" aria-label="Play episode ${i + 1}: ${esc(ep.title)}" title="${esc(ep.file)}"><span class="num">${i + 1}</span>` +
         `<span class="txt"><span class="t">${esc(ep.short)}</span>${sub ? `<span class="s">${esc(sub)}</span>` : ''}</span>` +
-        `<svg class="w" viewBox="0 0 24 24" aria-hidden="true"></svg><span class="d">${ep.duration ? fmtTime(ep.duration) : ''}</span></li>`;
+        `<svg class="w" viewBox="0 0 24 24" aria-hidden="true"></svg><span class="d">${ep.duration ? fmtTime(ep.duration) : ''}</span>` +
+        (IS_YOUTUBE ? `<button class="rowbtn" data-ac-action="queue-toggle" data-i="${i}"></button>` : '') + '</li>';
     });
     return html;
+  }
+
+  // YouTube rows: + adds to your queue, ✓ (already queued) removes it
+  // in the queue itself the button is a plain ×
+  function paintRowButton(btn, ep, queued) {
+    const look = S.source === 'ytqueue' ? 'remove' : queued ? 'in' : 'add';
+    if (btn._look === look) return;
+    btn._look = look;
+    btn.classList.toggle('in', look === 'in');
+    btn.innerHTML = svg({ remove: 'close', in: 'check', add: 'plus' }[look]);
+    btn.title = { remove: 'Remove from your queue', in: 'In your queue — click to remove', add: 'Add to your queue' }[look];
+    btn.setAttribute('aria-label', (look === 'add' ? `Add “${ep.title}” to` : `Remove “${ep.title}” from`) + ' your queue');
   }
 
   function applyFilter() {
@@ -1386,8 +1687,17 @@ footer .btn:hover { color: var(--fg); }
     if (msg.type === 'ping') { sendResponse({ ok: true, version: VERSION }); return; }
     if (msg.type === 'toggle-panel') setOpen(!S.open);
     else if (msg.type === 'open-panel') setOpen(true);
-    else if (msg.type === 'streams-changed' && !IS_ARCHIVE) rescanWeb();
-    else if (msg.type === 'api') {
+    else if (msg.type === 'streams-changed' && !IS_ARCHIVE && !IS_YOUTUBE) rescanWeb();
+    else if (msg.type === 'yt-update') onYtUpdate(msg.yt, msg.queue);
+    else if (msg.type === 'yt-cmd') {
+      // this tab is the YouTube player: the service worker drives it
+      if (msg.cmd === 'tv') setTv(msg.on);
+      else {
+        if (!S.isPlayer) { S.isPlayer = true; ysend('activate'); }
+        ysend(msg.cmd, msg);
+      }
+      sendResponse({ ok: true });
+    } else if (msg.type === 'api') {
       runApi(msg.cmd, msg.args).then(
         (result) => sendResponse({ ok: true, result }),
         (e) => sendResponse({ ok: false, error: e.message || String(e) }),
@@ -1396,35 +1706,67 @@ footer .btn:hover { color: var(--fg); }
     }
   });
 
+  // YouTube is a single-page app: /watch?v=A → /watch?v=B keeps the same pathname
+  const pathKey = () => location.pathname + (IS_YOUTUBE ? location.search : '');
+
   async function loadPage() {
-    S.path = location.pathname;
-    if (IS_ARCHIVE) await loadArchive(); else await loadWeb();
+    S.path = pathKey();
+    if (IS_ARCHIVE) await loadArchive();
+    else if (IS_YOUTUBE) await loadYouTube();
+    else await loadWeb();
   }
 
+  // watched marks / resume spot written by another tab (e.g. the YouTube player tab)
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !S.pageId) return;
+    const w = changes['ac:w:' + S.pageId];
+    const p = changes['ac:p:' + S.pageId];
+    if (w) { S.watched = new Set(w.newValue || []); renderList(); }
+    if (p) { S.progress = p.newValue || null; if ($ && S.open) renderControls(); }
+  });
+
   async function boot() {
-    const [settings, open, castingAt, aa] = await Promise.all([
+    const [settings, open, castingAt, aa, ytTarget] = await Promise.all([
       store.get('ac:settings', null), store.get('ac:open' + ORIGIN_KEY, false),
-      store.get('ac:castingAt' + ORIGIN_KEY, 0), store.get('ac:aa' + ORIGIN_KEY, false),
+      store.get('ac:castingAt' + ORIGIN_KEY, 0), store.get('ac:aa' + ORIGIN_KEY, false), store.get('ac:ytTarget', 'computer'),
     ]);
     if (settings) Object.assign(S.settings, settings);
-    S.autoAdvance = !IS_ARCHIVE && !!aa;
+    S.autoAdvance = !IS_ARCHIVE && !IS_YOUTUBE && !!aa;
     mount();
     const wantOpen = open || location.hash === '#archive-cast';
-    // re-attach to a running cast so progress tracking and the live indicator keep working
-    if (wantOpen || S.autoAdvance || Date.now() - castingAt < RECENT_CAST_MS) ensureSdk();
+    let hello = null;
+    if (IS_YOUTUBE) {
+      S.ytTarget = ytTarget === 'tv' ? 'tv' : 'computer';
+      hello = await bg('yt', { action: 'hello' });
+      if (hello && hello.ok) { S.ytQueue = hello.queue || []; S.yt = hello.yt; }
+    } else if (wantOpen || S.autoAdvance || Date.now() - castingAt < RECENT_CAST_MS) {
+      // re-attach to a running cast so progress tracking and the live indicator keep working
+      ensureSdk();
+    }
     await loadPage();
     readyResolve();
-    if (wantOpen) setOpen(true);
+    if (hello && hello.ok) {
+      if (hello.player) startPlayer(hello);
+      onYtUpdate(hello.yt, null);
+    }
+    if (wantOpen && !S.tv) setOpen(true);
     publish();
-    if (!IS_ARCHIVE) {
+    if (IS_YOUTUBE) {
+      // YouTube renders its lists late and swaps pages without reloading
+      for (const ms of [2000, 5000, 10000]) setTimeout(rescanYouTube, ms);
+      document.addEventListener('yt-navigate-finish', () => setTimeout(() => {
+        if (pathKey() !== S.path) loadPage(); else rescanYouTube();
+      }, 400));
+    } else if (!IS_ARCHIVE) {
       continueAssist();
       // players often fetch their media late; look again a few times
       for (const ms of [3000, 8000, 15000]) setTimeout(() => { if (!S.crawling) rescanWeb(); }, ms);
     }
     setInterval(() => {
-      if (location.pathname !== S.path) loadPage();
-      else if (!IS_ARCHIVE && S.open && !S.crawling) rescanWeb();
-    }, IS_ARCHIVE ? 1000 : 4000);
+      if (pathKey() !== S.path) loadPage();
+      else if (IS_YOUTUBE && S.open) rescanYouTube();
+      else if (!IS_ARCHIVE && !IS_YOUTUBE && S.open && !S.crawling) rescanWeb();
+    }, IS_ARCHIVE ? 1000 : IS_YOUTUBE ? 3000 : 4000);
   }
 
   boot();

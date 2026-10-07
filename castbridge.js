@@ -20,7 +20,7 @@
   const API = 'archive-cast:api';
   const API_RES = 'archive-cast:api-result';
   const PUB = 'archive-cast:public';
-  const VERSION = '2.0.0';
+  const VERSION = '2.1.0';
   const SDK_URL = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
   const DMR = 'CC1AD845'; // Default Media Receiver
   const MAX_CHUNK_BYTES = 40000; // Cast messages are capped at 64KB

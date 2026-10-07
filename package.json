@@ -1,6 +1,6 @@
 {
   "name": "archive-cast",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "Chrome extension: cast whole shows to a Chromecast in order with autoplay (archive.org, podcasts, other sites), scriptable by AI agents via JS API and MCP.",
   "license": "MIT",

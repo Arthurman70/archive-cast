@@ -1,16 +1,21 @@
-// End-to-end tests: loads the real extension into a throwaway Chrome profile (Puppeteer) and drives
-// it against a local test site that uses a fake Cast SDK (site/fakecast.js), plus live archive.org.
+// End-to-end tests: loads the real extension into a throwaway browser profile (Puppeteer) and drives
+// it against a local test site that uses a fake Cast SDK (site/fakecast.js), a fake youtube.com
+// served over local HTTPS (site/fakeyt.js), plus live archive.org.
 //
 //   cd test/e2e && npm install && npm test
 //   CHROME=/path/to/chrome npm test     (defaults to the usual Google Chrome install locations)
+//   CHROME=/path/to/brave npm test      (Brave works too; Brave-only checks switch on automatically)
 //   HEADFUL=1 npm test                  (watch it run)
+//   LIVE_YOUTUBE=1 npm test             (also smoke-test the real youtube.com)
 //   SCREENSHOT=../../docs/panel.png npm test
+// The fake YouTube needs openssl on PATH once, to make a throwaway certificate.
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +28,7 @@ const CHROME = process.env.CHROME || [
   '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
 ].find((p) => fs.existsSync(p));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const IS_BRAVE_RUN = /brave/i.test(CHROME || '');
 
 // ---------------------------------------------------------------- local test site
 const MEDIA_TYPES = { mp4: 'video/mp4', mp3: 'audio/mpeg', m3u8: 'application/vnd.apple.mpegurl', ts: 'video/mp2t' };
@@ -62,18 +68,24 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const ORIGIN = `http://127.0.0.1:${server.address().port}`;
 
 // ---------------------------------------------------------------- browser
-const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'archive-cast-e2e-'));
-const browser = await puppeteer.launch({
-  executablePath: CHROME,
-  headless: !process.env.HEADFUL,
-  pipe: true,
-  enableExtensions: [EXT],
-  userDataDir: profile,
-  defaultViewport: { width: 1280, height: 860 },
-  args: ['--no-first-run', '--no-default-browser-check', '--autoplay-policy=no-user-gesture-required'],
-});
-const swTarget = await browser.waitForTarget((t) => t.type() === 'service_worker' && t.url().endsWith('/background.js'));
-const sw = await swTarget.worker();
+const profiles = [];
+async function launch(extraArgs = [], extra = {}) {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'archive-cast-e2e-'));
+  profiles.push(profile);
+  const b = await puppeteer.launch(Object.assign({
+    executablePath: CHROME,
+    headless: !process.env.HEADFUL,
+    pipe: true,
+    enableExtensions: [EXT],
+    userDataDir: profile,
+    defaultViewport: { width: 1280, height: 860 },
+    args: ['--no-first-run', '--no-default-browser-check', '--autoplay-policy=no-user-gesture-required', ...extraArgs],
+  }, extra));
+  const t = await b.waitForTarget((x) => x.type() === 'service_worker' && x.url().endsWith('/background.js'));
+  return { browser: b, sw: await t.worker() };
+}
+console.log(`browser: ${CHROME}${IS_BRAVE_RUN ? ' (Brave)' : ''}`);
+let { browser, sw } = await launch();
 
 const results = [];
 async function step(name, fn) {
@@ -297,6 +309,13 @@ await step('archive.org (live): episodes from metadata, Cast SDK through the pag
   const sdk = await waitFor(async () => { const s = (await state(page)).cast; return s.sdk !== 'loading' && s.sdk !== 'idle' && s; }, 25000, 'Cast SDK result');
   console.log(`    archive.org Cast SDK: ${sdk.sdk}${sdk.error ? ' (' + sdk.error + ')' : ''}, mode ${sdk.mode}, state ${sdk.state}`);
   assert.notEqual(sdk.sdk, 'blocked', 'CSP must not block the SDK');
+  if (IS_BRAVE_RUN && (sdk.sdk === 'unavailable' || sdk.state === 'NO_DEVICES_AVAILABLE')) {
+    // a fresh Brave profile has Google Cast ("Media Router") switched off: the panel must say so
+    const msg = await waitFor(() => page.$eval('archive-cast-ui', (h) => { const m = h.shadowRoot.querySelector('.msg'); return !m.hidden && m.textContent; }), 5000, 'Brave hint');
+    assert.match(msg, /Media Router/);
+    assert.equal((await state(page)).browser, 'brave');
+    console.log('    Brave hint shown: ' + msg.replace(/\s+/g, ' ').slice(0, 110) + '…');
+  }
   if (process.env.SCREENSHOT) {
     await page.goto('https://archive.org/details/GreenAcresCompleteSeries', { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForFunction(() => window.ArchiveCast && window.ArchiveCast.state && window.ArchiveCast.state.page.status === 'ready', { timeout: 30000 });
@@ -344,10 +363,202 @@ await step('MCP: an AI client opens a show and reads its episodes through the br
   }
 });
 
-// ---------------------------------------------------------------- done
 await browser.close();
+
+// ================================================================ YouTube (fake youtube.com over local HTTPS)
+const YT_VIDEOS = {
+  TestVideo01: ['Test Video 1', 'Channel A'], TestVideo02: ['Test Video 2', 'Channel B'], TestVideo03: ['Test Video 3', 'Channel C'],
+  TestVideo04: ['Test Video 4', 'Channel D'], TestVideo05: ['Suggested Video', 'Channel E'],
+};
+const related = (ids) => ids.map((id) => `<ytd-compact-video-renderer><a id="thumbnail" href="/watch?v=${id}"></a>
+  <a id="video-title" href="/watch?v=${id}" title="${YT_VIDEOS[id][0]}">${YT_VIDEOS[id][0]}</a><ytd-channel-name><a href="/@x">${YT_VIDEOS[id][1]}</a></ytd-channel-name>
+  <ytd-thumbnail-overlay-time-status-renderer><span id="text">0:03</span></ytd-thumbnail-overlay-time-status-renderer></ytd-compact-video-renderer>`).join('');
+function ytPage(url) {
+  const v = url.searchParams.get('v');
+  const shell = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title} - YouTube</title></head>
+<body style="margin:0;font:14px system-ui;background:#0f0f0f;color:#f1f1f1"><div id="masthead-container" style="height:56px">FakeTube</div>${body}</body></html>`;
+  if (url.pathname === '/watch' && YT_VIDEOS[v]) {
+    return shell(YT_VIDEOS[v][0], `<meta name="title" content="${YT_VIDEOS[v][0]}"><meta itemprop="duration" content="PT0M3S">
+<div id="primary"><div id="movie_player" style="width:640px;height:360px;background:#222"><div class="html5-video-container"><video></video></div>
+<div class="ytp-chrome-bottom"><button class="ytp-autonav-toggle-button" aria-checked="true">Autoplay</button></div></div>
+<ytd-watch-metadata><h1 class="ytd-watch-metadata">${YT_VIDEOS[v][0]}</h1><div id="owner"><ytd-channel-name><a href="/@a">${YT_VIDEOS[v][1]}</a></ytd-channel-name></div></ytd-watch-metadata></div>
+<div id="secondary">${related(['TestVideo02', 'TestVideo03', 'TestVideo04'].filter((id) => id !== v))}
+<ytd-ad-slot-renderer><a id="video-title" href="/watch?v=AdVideo0001" title="Buy things">Buy things</a></ytd-ad-slot-renderer></div>
+<script src="/fakeyt.js"></script>`);
+  }
+  if (url.pathname === '/playlist') {
+    const rows = ['TestVideo03', 'TestVideo01', 'TestVideo04'].map((id, i) => `<ytd-playlist-video-renderer>
+<a id="video-title" href="/watch?v=${id}&list=PLtest&index=${i + 1}" title="${YT_VIDEOS[id][0]}">${YT_VIDEOS[id][0]}</a></ytd-playlist-video-renderer>`).join('');
+    return shell('Test Playlist', `<ytd-playlist-header-renderer><h1 class="title">Test Playlist</h1></ytd-playlist-header-renderer>${rows}${related(['TestVideo02'])}`);
+  }
+  if (url.pathname === '/results') {
+    // the 2025+ "lockup" layout: no #video-title, titles in an h3
+    return shell('test', ['TestVideo04', 'TestVideo02'].map((id) => `<yt-lockup-view-model><a href="/watch?v=${id}"><img alt=""></a>
+<h3><a href="/watch?v=${id}">${YT_VIDEOS[id][0]}</a></h3></yt-lockup-view-model>`).join(''));
+  }
+  return null;
+}
+
+const certDir = path.join(HERE, 'certs');
+if (!fs.existsSync(path.join(certDir, 'cert.pem'))) {
+  fs.mkdirSync(certDir, { recursive: true });
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', path.join(certDir, 'key.pem'), '-out', path.join(certDir, 'cert.pem'),
+    '-days', '3650', '-subj', '/CN=www.youtube.com', '-addext', 'subjectAltName=DNS:www.youtube.com,DNS:youtube.com'], { stdio: 'ignore', env: { ...process.env, MSYS_NO_PATHCONV: '1' } });
+}
+const ytServer = https.createServer({ key: fs.readFileSync(path.join(certDir, 'key.pem')), cert: fs.readFileSync(path.join(certDir, 'cert.pem')) }, (req, res) => {
+  const url = new URL(req.url, 'https://www.youtube.com');
+  if (url.pathname === '/fakeyt.js') { res.writeHead(200, { 'Content-Type': 'text/javascript' }); return fs.createReadStream(path.join(SITE, 'fakeyt.js')).pipe(res); }
+  if (url.pathname === '/oembed') {
+    const id = new URL(url.searchParams.get('url')).searchParams.get('v');
+    if (!YT_VIDEOS[id]) { res.writeHead(404); return res.end(); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ title: YT_VIDEOS[id][0], author_name: YT_VIDEOS[id][1] }));
+  }
+  const html = ytPage(url);
+  if (!html) { res.writeHead(404); return res.end(); }
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(html);
+});
+await new Promise((r) => ytServer.listen(0, '127.0.0.1', r));
+const ytPort = ytServer.address().port;
+({ browser, sw } = await launch([`--host-resolver-rules=MAP www.youtube.com:443 127.0.0.1:${ytPort}`, '--ignore-certificate-errors'], { acceptInsecureCerts: true }));
+
+const pageWhere = (b, pred, ms = 10000) => waitFor(async () => (await b.pages()).find((p) => pred(p.url())), ms, 'page');
+let ytTab, playerTab;
+
+await step('YouTube: a watch page lists this video and the related ones (ads skipped)', async () => {
+  ytTab = await browser.newPage();
+  await ytTab.goto('https://www.youtube.com/watch?v=TestVideo01');
+  await ytTab.waitForFunction(() => window.ArchiveCast && window.ArchiveCast.state && window.ArchiveCast.state.page.status === 'ready', { timeout: 15000 });
+  await api(ytTab, () => ArchiveCast.openPanel());
+  const eps = await api(ytTab, () => ArchiveCast.listEpisodes());
+  assert.equal(eps.source, 'page');
+  assert.deepEqual(eps.items.map((e) => e.title), ['Test Video 1', 'Test Video 2', 'Test Video 3', 'Test Video 4']);
+  assert.equal(eps.items[1].duration, 3);
+});
+
+await step('YouTube: + queues a video; youtubeAdd takes links and looks up titles', async () => {
+  const plus = await ytTab.waitForSelector('archive-cast-ui >>> .ep[data-i="1"] .rowbtn', { visible: true });
+  await plus.click(); // a real click, like a person
+  await waitFor(async () => (await state(ytTab)).youtube.queueLength === 1, 5000, 'queued by click');
+  const r = await api(ytTab, () => ArchiveCast.call('youtubeAdd', { videos: ['https://youtu.be/TestVideo03', 'TestVideo04'] }));
+  assert.deepEqual(r.queue.map((v) => v.title), ['Test Video 2', 'Test Video 3', 'Test Video 4']);
+  await waitFor(() => ytTab.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.ep[data-i="2"] .rowbtn').classList.contains('in')), 4000, 'row shows ✓');
+});
+
+await step('YouTube: the queue plays in a player tab on this computer, in order, and YouTube’s own autoplay is kept out', async () => {
+  await api(ytTab, () => ArchiveCast.setSource('ytqueue'));
+  const st = await api(ytTab, () => ArchiveCast.play(0));
+  assert.equal(st.nowPlaying.title, 'Test Video 2');
+  assert.equal(st.youtube.target, 'computer');
+  playerTab = await pageWhere(browser, (u) => u.includes('ac_player=1'));
+  await waitFor(async () => (await state(ytTab)).nowPlaying?.index === 1, 12000, 'second video');
+  await waitFor(async () => (await state(ytTab)).nowPlaying?.index === 2, 12000, 'third video');
+  await waitFor(async () => (await state(ytTab)).nowPlaying?.idleReason === 'FINISHED', 12000, 'end of queue');
+  await sleep(2500); // the fake would wander to a "suggested" video if autonav were still on
+  assert.ok(!playerTab.url().includes('TestVideo05'), 'stayed put after the last video');
+  assert.deepEqual(await api(playerTab, () => window.__fakeyt.loads), ['TestVideo03', 'TestVideo04']);
+});
+
+await step('YouTube: remote control from another tab (pause, seek, next, previous, volume)', async () => {
+  await api(ytTab, () => ArchiveCast.play(0));
+  let st = await api(ytTab, () => ArchiveCast.pause());
+  assert.equal(st.nowPlaying.state, 'PAUSED');
+  st = await api(ytTab, () => ArchiveCast.seek(2));
+  assert.ok(Math.abs(st.nowPlaying.time - 2) <= 1);
+  st = await api(ytTab, () => ArchiveCast.next());
+  assert.equal(st.nowPlaying.index, 1);
+  st = await api(ytTab, () => ArchiveCast.previous());
+  assert.equal(st.nowPlaying.index, 0);
+  st = await api(ytTab, () => ArchiveCast.setVolume(0.3));
+  assert.equal(st.cast.volume, 0.3);
+});
+
+await step('YouTube TV mode: the player moves to its own window and fills it, ready to cast as a tab', async () => {
+  const before = await sw.evaluate(() => chrome.windows.getAll().then((w) => w.length));
+  await api(ytTab, () => ArchiveCast.call('youtubeControl', { action: 'target', target: 'tv' }));
+  await waitFor(() => playerTab.evaluate(() => document.documentElement.classList.contains('ac-tv')), 6000, 'TV mode on');
+  assert.equal(await sw.evaluate(() => chrome.windows.getAll().then((w) => w.length)), before + 1, 'own window');
+  const box = await playerTab.$eval('#movie_player', (el) => { const r = el.getBoundingClientRect(); return { w: r.width, h: r.height, vw: innerWidth, vh: innerHeight }; });
+  assert.ok(box.w >= box.vw - 1 && box.h >= box.vh - 1, `player fills the window (${box.w}x${box.h} of ${box.vw}x${box.vh})`);
+  assert.ok(await playerTab.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.launcher').hidden), 'no launcher on the TV picture');
+  const msg = await ytTab.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.msg').textContent).catch(() => '');
+  void msg;
+  await api(ytTab, () => ArchiveCast.call('youtubeControl', { action: 'target', target: 'computer' }));
+  await waitFor(() => playerTab.evaluate(() => !document.documentElement.classList.contains('ac-tv')), 6000, 'TV mode off');
+});
+
+await step('YouTube: stop closes the player tab', async () => {
+  const st = await api(ytTab, () => ArchiveCast.stop());
+  assert.notEqual(st.cast.state, 'CONNECTED');
+  await waitFor(() => playerTab.isClosed(), 5000, 'player closed');
+});
+
+await step('YouTube: right-click "Add to Archive Cast queue" (menu handler) and MCP-style queue commands', async () => {
+  const r = await sw.evaluate(() => ytQueueAdd(['https://www.youtube.com/watch?v=TestVideo01'], true));
+  assert.equal(r.queue[0].id, 'TestVideo01', 'next=true puts it first when nothing is playing');
+  const q = await sw.evaluate(() => routeApi('youtubeQueue', {}));
+  assert.equal(q.queue.length, 4);
+  await sw.evaluate(() => routeApi('youtubeMove', { from: 0, to: 3 }));
+  await sw.evaluate(() => routeApi('youtubeRemove', { index: 3 }));
+  assert.deepEqual((await sw.evaluate(() => routeApi('youtubeQueue', {}))).queue.map((v) => v.id), ['TestVideo02', 'TestVideo03', 'TestVideo04']);
+  const err = await sw.evaluate(() => routeApi('youtubeAdd', { videos: ['https://example.com/not-youtube'] }).then(() => null, (e) => e.message));
+  assert.match(err, /Not a YouTube video/);
+});
+
+await step('YouTube: playlist and search-results pages', async () => {
+  const pl = await browser.newPage();
+  await pl.goto('https://www.youtube.com/playlist?list=PLtest');
+  await pl.waitForFunction(() => window.ArchiveCast && window.ArchiveCast.state && window.ArchiveCast.state.page.status === 'ready', { timeout: 15000 });
+  const eps = await api(pl, () => ArchiveCast.listEpisodes());
+  assert.equal(eps.source, 'playlist', 'an open playlist is shown first');
+  assert.deepEqual(eps.items.map((e) => e.title), ['Test Video 3', 'Test Video 1', 'Test Video 4']);
+  await pl.goto('https://www.youtube.com/results?search_query=test');
+  await pl.waitForFunction(() => window.ArchiveCast && window.ArchiveCast.state && window.ArchiveCast.state.page.status === 'ready', { timeout: 15000 });
+  await api(pl, () => ArchiveCast.setSource('page'));
+  const res = await api(pl, () => ArchiveCast.listEpisodes());
+  assert.deepEqual(res.items.map((e) => e.title), ['Test Video 4', 'Test Video 2']);
+  if (process.env.SCREENSHOT) {
+    await api(pl, () => ArchiveCast.openPanel());
+    await api(pl, () => ArchiveCast.setSource('ytqueue'));
+    await sleep(500);
+    const box = await pl.$eval('archive-cast-ui', (h) => { const r = h.shadowRoot.querySelector('.panel').getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; });
+    await pl.screenshot({ path: path.resolve(path.dirname(process.env.SCREENSHOT), 'youtube.png'), clip: { x: box.x - 24, y: box.y - 24, width: box.width + 48, height: box.height + 48 } });
+  }
+  await pl.close();
+});
+
+await browser.close();
+ytServer.close();
+
+// ================================================================ live youtube.com (optional)
+if (process.env.LIVE_YOUTUBE) {
+  ({ browser, sw } = await launch());
+  await step('youtube.com (live): panel renders under YouTube’s Trusted Types; the player tab drives the real player', async () => {
+    const page = await browser.newPage();
+    await page.setUserAgent((await browser.userAgent()).replace('HeadlessChrome', 'Chrome'));
+    await page.goto('https://www.youtube.com/watch?v=jNQXAC9IVRw', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForFunction(() => window.ArchiveCast && window.ArchiveCast.state && window.ArchiveCast.state.page.status === 'ready', { timeout: 30000 });
+    await api(page, () => ArchiveCast.openPanel());
+    const eps = await api(page, () => ArchiveCast.listEpisodes({ limit: 5 }));
+    console.log(`    found ${eps.total} videos; first: ${eps.items[0] && eps.items[0].title}`);
+    assert.equal(eps.items[0].url, 'https://www.youtube.com/watch?v=jNQXAC9IVRw');
+    assert.ok(await page.$eval('archive-cast-ui', (h) => !!h.shadowRoot.querySelector('.panel:not([hidden]) .now-title')), 'panel rendered');
+    await api(page, () => ArchiveCast.call('youtubeClear'));
+    await api(page, () => ArchiveCast.call('youtubePlay', { videos: ['jNQXAC9IVRw'] }));
+    const player = await pageWhere(browser, (u) => u.includes('ac_player=1'));
+    const st = await waitFor(async () => { const s = (await state(page)).nowPlaying; return s && s.state !== 'BUFFERING' && s; }, 30000, 'real player state').catch((e) => ({ error: e.message }));
+    console.log(`    player tab state: ${JSON.stringify(st)}`);
+    const ready = await player.evaluate(() => { const p = document.getElementById('movie_player'); return !!(p && p.getPlayerState); });
+    assert.ok(ready, 'YouTube’s player API is reachable from the player tab');
+    await page.close();
+  });
+  await browser.close();
+}
+
+// ---------------------------------------------------------------- done
 server.close();
-fs.rmSync(profile, { recursive: true, force: true });
+for (const p of profiles) fs.rmSync(p, { recursive: true, force: true });
 const failed = results.filter((r) => r[0] === 'fail');
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
 process.exit(failed.length ? 1 : 0);

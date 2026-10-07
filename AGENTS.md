@@ -1,12 +1,16 @@
 # Archive Cast for AI agents
 
-Archive Cast casts a whole show to a Chromecast as one queue that plays itself. It works for archive.org shows, podcasts, and video or audio on other sites. It does not cast the tab, and once queued, playback continues even if the tab closes. This file is for agents that control it. People should start with the [README](README.md).
+Archive Cast casts a whole show to a Chromecast as one queue that plays itself. It works for archive.org shows, podcasts, and video or audio on other sites. It does not cast the tab, and once queued, playback continues even if the tab closes. It also keeps a **YouTube queue**, which plays in a dedicated player tab on the computer, or full-bleed in its own window when the browser casts that tab to a TV (see [YouTube](#youtube)). This file is for agents that control it. People should start with the [README](README.md).
 
 ## The one thing you can't automate
 
 Chrome only opens its Chromecast picker after a real click. A person, or an agent that clicks real coordinates (CDP `Input.dispatchMouseEvent`, computer use), presses **Connect** in the panel, which has `data-ac-action="connect"`, and picks the device. After that, every command below works without clicks. This includes later page loads on the same site, because the session reconnects automatically.
 
 If a command fails with `Not connected to a Chromecast…`, ask the user to press Connect, then retry. On sites that already have their own Cast session, such as one started with the site's Cast button, `play` reuses that session and no click is needed.
+
+YouTube has the same kind of human step for TVs. The browser's **Cast → Cast tab** on the player window can only be started from the browser's own menu. Everything on the computer works without it.
+
+In **Brave**, casting only works after the user turns on **Media Router** in Settings → Extensions and restarts Brave. `state.browser` is `"brave"` there. If `cast.state` stays `NO_DEVICES_AVAILABLE`, tell the user about this switch.
 
 ## Four ways in
 
@@ -47,7 +51,7 @@ The same state also fires as a `window` event, `archivecast:statechange`, with t
 
 The panel lives in the open shadow root of `<archive-cast-ui>`. Every control has a stable `data-ac-action`:
 
-`open-panel`, `close-panel`, `connect`, `toggle`, `previous`, `next`, `back-10`, `forward-30`, `seek` (range), `volume` (range), `mute`, `source` (select), `quality` (select), `loop` (checkbox), `auto-advance` (checkbox), `play-all`, `resume`, `find-more`, `filter` (search box), `rescan`, `disconnect`, `stop`.
+`open-panel`, `close-panel`, `connect`, `toggle`, `previous`, `next`, `back-10`, `forward-30`, `seek` (range), `volume` (range), `mute`, `source` (select), `quality` (select), `loop` (checkbox), `auto-advance` (checkbox), `play-all`, `resume`, `find-more`, `filter` (search box), `rescan`, `disconnect`, `stop`, plus on YouTube `queue-toggle` (each row's +/✓), `queue-all`, `queue-clear` and `show-player`. On YouTube, `connect` switches between playing on this computer and on the TV.
 
 Each episode is `li.ep[role=button]`, with `aria-label="Play episode N: <title>"` and `data-i` holding its 0-based index. The playing episode has `aria-current="true"`.
 
@@ -88,9 +92,33 @@ chrome.runtime.sendMessage(ARCHIVE_CAST_ID, { cmd: 'play', args: { index: 0 } },
 
 The extension ID is shown in Archive Cast's options page. It's derived from the folder path for unpacked installs.
 
+## YouTube
+
+YouTube works differently from everything else. Its videos only play inside YouTube's own player, so Archive Cast doesn't send them to the Chromecast's Default Media Receiver. Instead:
+
+- **The queue** (`youtubeAdd` / `youtubeRemove` / `youtubeMove` / `youtubeClear`) is one list for the whole browser, stored by the extension.
+- **The player tab:** `youtubePlay` opens one youtube.com tab marked `ac_player=1` and drives YouTube's player in it: next video at the end, skip, seek, volume. YouTube's own "autoplay a suggestion" is switched off in that tab.
+- **The target:**
+  - `computer`: the player is a normal tab.
+  - `tv`: the player moves to its own window, fills it edge to edge with no YouTube interface, and the panel tells the user to **Cast → Cast tab** from the browser menu. The browser does the casting, not the TV's YouTube app. In Brave, Shields' ad blocking therefore applies to what reaches the TV.
+- **Control from any tab:** on youtube.com tabs, the regular transport commands (`play`, `pause`, `next`, `seek`, `volume`…) and `state` drive and describe the YouTube player. From anywhere else, use `youtubeControl` / `youtubeQueue` through MCP or extension messaging.
+
+```js
+// on any youtube.com page
+await ArchiveCast.call('youtubeAdd', { videos: ['https://youtu.be/dQw4w9WgXcQ', 'jNQXAC9IVRw'] });
+await ArchiveCast.call('youtubePlay', { target: 'computer' });   // or 'tv'
+await ArchiveCast.next();                                          // same transport as everywhere else
+```
+
+```bash
+node mcp/server.mjs call youtube_add_to_queue '{"videos":["https://www.youtube.com/watch?v=jNQXAC9IVRw"]}'
+node mcp/server.mjs call youtube_play '{"target":"tv"}'
+node mcp/server.mjs call youtube_control '{"action":"seek","delta":-30}'
+```
+
 ## Commands
 
-`?` marks an optional argument. Every `tab` command also takes `tabId?` when sent through MCP or extension messaging. `browser` commands are only available through MCP and extension messaging, never from web pages.
+`?` marks an optional argument. Every `tab` command also takes `tabId?` when sent through MCP or extension messaging. `browser` commands are only available through MCP and extension messaging, never from web pages. The one exception: youtube.com pages may call the `youtube*` commands through `ArchiveCast.call`.
 
 | Command (`ArchiveCast.call` / messaging) | MCP tool | Args | Scope | What it does |
 |---|---|---|---|---|
@@ -116,6 +144,13 @@ The extension ID is shown in Archive Cast's options page. It's derived from the 
 | `closePanel` | `close_panel` |  | tab | Hide the panel (casting continues). |
 | `connect` | `connect_chromecast` |  | tab | Open Chrome's Chromecast picker. Needs a real click (see above). From a script it just returns the state with a note. |
 | `stop` | `stop_casting` | `keepPlaying?` | tab | Stop casting. With `keepPlaying: true` only this browser disconnects and the Chromecast keeps going. |
+| `youtubeQueue` | `youtube_get_queue` |  | browser | The YouTube queue and what the YouTube player is doing (current video, state, time, target). |
+| `youtubeAdd` | `youtube_add_to_queue` | `videos`, `next?` | browser | Add videos (IDs or any youtube.com / youtu.be URL); titles are looked up. `next: true` inserts after the playing video. Re-adding moves a video. |
+| `youtubeRemove` | `youtube_remove_from_queue` | `index` | browser | Remove one video from the queue. |
+| `youtubeMove` | `youtube_move_in_queue` | `from`, `to` | browser | Reorder the queue. |
+| `youtubeClear` | `youtube_clear_queue` |  | browser | Empty the queue. |
+| `youtubePlay` | `youtube_play` | `videos?`, `index?`, `startTime?`, `target?` | browser | Play the queue from `index` (or the given `videos`) in order with autoplay in the player tab. `target`: `computer` (a tab) or `tv` (own window, full-bleed, for casting the tab). |
+| `youtubeControl` | `youtube_control` | `action`, `index?`, `time?`, `delta?`, `level?`, `muted?`, `target?` | browser | `pause`, `resume`, `toggle`, `next`, `previous`, `jump {index}`, `seek {time\|delta}`, `volume {level}`, `mute {muted}`, `target {target}`, `show`, `stop` (closes the player). |
 | `tabs` | `list_tabs` |  | browser | Tabs where Archive Cast is active, with what each is doing. |
 | `open` | `open_page` | `url`, `active?` | browser | Open a page in Chrome, show the panel, and return its state and first 25 episodes. |
 | `help` | — |  | browser | The command catalog. |
@@ -150,6 +185,8 @@ The authoritative list, with JSON Schemas, is [`lib/commands.js`](lib/commands.j
 - **A site whose own Cast player stops after each episode:** the user casts with the site's Cast button as usual → `set_auto_advance {on:true}`. Archive Cast opens each next-episode page and presses the site's play button when an episode ends. Keep that tab open: unlike the queue, this runs in the browser.
 - **A one-episode-per-page site with plain video links:** `find_more_episodes` → `set_source {id:"follow"}` → `play_episode {index:0}`.
 - **Something not found on the page:** have the page's player start, then `rescan_page`. Streams Chrome actually loaded show up as source `streams`.
+- **"Queue these YouTube videos and put them on the TV":** `youtube_add_to_queue {videos:[…]}` → `youtube_play {target:"tv"}` → tell the user to pick **Cast → Cast tab** for the player window, once.
+- **"Play the rest of this playlist":** on the playlist page, `list_episodes` (source `playlist`) → `play_episode {index}`.
 
 ## Limits worth knowing
 

@@ -2,13 +2,13 @@
 // - Toolbar button: toggles the panel (injecting it on any site you open it on).
 // - Watches network responses for castable media so JS-built players can be cast too.
 // - Routes commands from other extensions and the local MCP bridge to the right tab.
-importScripts('lib/generic.js', 'lib/commands.js');
+importScripts('lib/generic.js', 'lib/commands.js', 'lib/youtube.js');
 
 const GEN = self.ArchiveCastGeneric;
 const CMDS = self.ArchiveCastCommands;
 const VERSION = chrome.runtime.getManifest().version;
 const ARCHIVE = /^https:\/\/(www\.)?archive\.org\//i;
-const ISO_FILES = ['lib/episodes.js', 'lib/generic.js', 'lib/commands.js', 'content.js'];
+const ISO_FILES = ['lib/episodes.js', 'lib/generic.js', 'lib/commands.js', 'lib/youtube.js', 'content.js'];
 const MAIN_FILES = ['castbridge.js'];
 const BRIDGE_DEFAULTS = { enabled: false, port: 47811, allowExtensions: false };
 const MAX_FETCH_BYTES = 8 * 1024 * 1024;
@@ -150,6 +150,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   chrome.storage.session.remove(['ac:streams:' + tabId, 'ac:assist:' + tabId]).catch(() => {});
   if (tabStatus.delete(tabId)) persistStatus();
   chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [tabId] }).catch(() => {});
+  ytGet().then((s) => {
+    if (s.playerTabId !== tabId) return;
+    Object.assign(s, { playerTabId: null, status: null, finished: false });
+    ytSave();
+    ytBroadcast();
+  });
 });
 
 async function fetchForPage(url) {
@@ -207,7 +213,340 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }));
     }
     case 'relaxCsp': return reply(relaxCsp(tabId));
+    case 'yt': return reply(ytFromTab(msg, sender.tab));
+    case 'api':
+      // youtube.com pages may drive the YouTube queue through window.ArchiveCast; nothing else
+      if (!/^youtube[A-Z]/.test(msg.cmd || '') || !/^https:\/\/(www\.|m\.)?youtube\.com\//.test(sender.tab.url || '')) return;
+      return reply(routeApi(msg.cmd, msg.args).then((result) => ({ ok: true, result })));
+    case 'openSettings':
+      // Brave: Settings → Extensions holds the "Media Router" (Google Cast) switch
+      chrome.tabs.create({ url: 'chrome://settings/extensions' }).catch(() => chrome.tabs.create({ url: 'chrome://settings' }));
+      return;
   }
+});
+
+// ================================================================ YouTube queue + player tab
+// The queue lives in storage.local; playback state in storage.session. Videos play in a dedicated
+// youtube.com tab (the "player tab") driven through ytbridge.js. For the TV that tab goes
+// full-bleed ("TV mode") in its own window and the browser casts the tab, so the TV's YouTube app
+// is never involved and the browser's own ad blocking (e.g. Brave Shields) applies.
+const YT = self.ArchiveCastYouTube;
+const YT_DEFAULTS = { items: [], index: 0, target: 'computer', tv: false, playerTabId: null, status: null, finished: false, listKey: null, endedFor: null, loadedAt: 0, lastError: null };
+let ytState = null;
+
+async function ytGet() {
+  if (!ytState) {
+    const o = await chrome.storage.session.get('ac:yt');
+    ytState = Object.assign({}, YT_DEFAULTS, o['ac:yt']);
+  }
+  return ytState;
+}
+
+function ytSave() { chrome.storage.session.set({ 'ac:yt': ytState }).catch(() => {}); }
+
+async function ytQueue() {
+  const o = await chrome.storage.local.get('ac:ytq');
+  return Array.isArray(o['ac:ytq']) ? o['ac:ytq'] : [];
+}
+
+async function ytSetQueue(q) {
+  await chrome.storage.local.set({ 'ac:ytq': q });
+  ytBroadcast();
+  return q;
+}
+
+async function oembed(id) {
+  try {
+    const r = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(YT.watchUrl(id)), { credentials: 'omit' });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return { title: j.title || null, channel: j.author_name || null };
+  } catch (_) { return null; }
+}
+
+// videos: IDs, YouTube URLs, or {id|url, title?, channel?, duration?}
+async function ytNormalize(videos) {
+  const out = [];
+  for (const v of [].concat(videos || [])) {
+    const id = typeof v === 'string' ? (YT.isId(v) ? v : YT.videoId(v))
+      : v && (YT.isId(v.id) ? v.id : YT.videoId(v.url || ''));
+    if (!id) throw new Error('Not a YouTube video: ' + (typeof v === 'string' ? v : JSON.stringify(v)));
+    out.push({ id, title: (v && v.title) || null, channel: (v && v.channel) || null, duration: (v && v.duration) || null });
+  }
+  await Promise.all(out.filter((v) => !v.title).map(async (v) => {
+    const m = await oembed(v.id);
+    if (m) { v.title = m.title; v.channel = v.channel || m.channel; }
+  }));
+  for (const v of out) if (!v.title) v.title = v.id;
+  return out;
+}
+
+async function ytQueueAdd(videos, next) {
+  const add = await ytNormalize(videos);
+  if (!add.length) throw new Error('No videos given.');
+  const ids = new Set(add.map((v) => v.id));
+  const q = (await ytQueue()).filter((v) => !ids.has(v.id)); // re-adding moves a video
+  const s = await ytGet();
+  let at = q.length;
+  if (next) {
+    const playing = s.playerTabId != null && s.listKey === 'ytqueue' && s.items[s.index];
+    at = (playing ? q.findIndex((v) => v.id === playing.id) : -1) + 1;
+  }
+  q.splice(at, 0, ...add);
+  await ytSetQueue(q);
+  return { added: add.map((v) => v.title), queue: q };
+}
+
+async function ytQueueRemove(index) {
+  const q = await ytQueue();
+  if (!(index >= 0 && index < q.length)) throw new Error(`No queue item ${index} (the queue has ${q.length}).`);
+  const [removed] = q.splice(index, 1);
+  await ytSetQueue(q);
+  return { removed: removed.title, queue: q };
+}
+
+async function ytQueueMove(from, to) {
+  const q = await ytQueue();
+  if (!(from >= 0 && from < q.length) || !(to >= 0 && to < q.length)) throw new Error('Queue position out of range.');
+  const [v] = q.splice(from, 1);
+  q.splice(to, 0, v);
+  await ytSetQueue(q);
+  return { queue: q };
+}
+
+function ytPublic(s) {
+  return {
+    active: s.playerTabId != null, target: s.target, tv: s.tv, index: s.index, finished: s.finished, listKey: s.listKey,
+    items: s.items.map(({ id, title, channel, duration }) => ({ id, title, channel, duration })),
+    status: s.status, lastError: s.lastError, playerTabId: s.playerTabId,
+  };
+}
+
+let ytTimer = null;
+function ytBroadcast() {
+  if (ytTimer) return;
+  ytTimer = setTimeout(async () => {
+    ytTimer = null;
+    const msg = { type: 'yt-update', yt: ytPublic(await ytGet()), queue: await ytQueue() };
+    for (const t of await chrome.tabs.query({ url: ['*://*.youtube.com/*'] })) chrome.tabs.sendMessage(t.id, msg).catch(() => {});
+  }, 250);
+}
+
+async function ytPlayerTab() {
+  const s = await ytGet();
+  return s.playerTabId != null ? chrome.tabs.get(s.playerTabId).catch(() => null) : null;
+}
+
+async function ytCmd(cmd) {
+  const tab = await ytPlayerTab();
+  if (!tab) throw new Error('Nothing is playing. Start the YouTube queue first.');
+  try { return await chrome.tabs.sendMessage(tab.id, Object.assign({ type: 'yt-cmd' }, cmd)); } catch (_) {
+    throw new Error('The YouTube player tab isn’t responding (it may still be loading).');
+  }
+}
+
+// Computer: a normal tab. TV: its own window, full-bleed, ready to be cast as a tab.
+async function ytApplyTarget(tab) {
+  const s = await ytGet();
+  s.tv = s.target === 'tv';
+  ytSave();
+  if (s.tv) {
+    const siblings = await chrome.tabs.query({ windowId: tab.windowId });
+    if (siblings.length > 1) await chrome.windows.create({ tabId: tab.id, focused: true, width: 1280, height: 760 });
+    else await chrome.windows.update(tab.windowId, { focused: true });
+  } else {
+    await chrome.tabs.update(tab.id, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+  }
+  chrome.tabs.sendMessage(tab.id, { type: 'yt-cmd', cmd: 'tv', on: s.tv }).catch(() => {});
+}
+
+async function ytOpenPlayer(startTime) {
+  const s = await ytGet();
+  const cur = s.items[s.index];
+  let tab = await ytPlayerTab();
+  if (tab) {
+    await ytApplyTarget(tab);
+    await chrome.tabs.sendMessage(tab.id, { type: 'yt-cmd', cmd: 'load', id: cur.id, start: startTime || 0, force: true }).catch(() => {});
+    return tab.id;
+  }
+  const url = YT.watchUrl(cur.id) + '&ac_player=1' + (startTime > 0 ? `&t=${Math.floor(startTime)}s` : '');
+  if (s.target === 'tv') tab = (await chrome.windows.create({ url, focused: true, width: 1280, height: 760 })).tabs[0];
+  else tab = await chrome.tabs.create({ url, active: true });
+  s.playerTabId = tab.id;
+  ytSave();
+  return tab.id;
+}
+
+async function ytPlay({ videos, index = 0, startTime = 0, target, listKey }) {
+  const s = await ytGet();
+  let items;
+  if (videos && [].concat(videos).length) items = await ytNormalize(videos);
+  else {
+    items = await ytQueue();
+    listKey = 'ytqueue';
+    if (!items.length) throw new Error('The YouTube queue is empty — add videos first.');
+  }
+  if (!(index >= 0 && index < items.length)) throw new Error(`Video index ${index} is out of range (0–${items.length - 1}).`);
+  if (target && !['computer', 'tv'].includes(target)) throw new Error('target must be "computer" or "tv".');
+  Object.assign(s, {
+    items: items.slice(0, 1000), index, target: target || s.target || 'computer', finished: false,
+    listKey: listKey || null, endedFor: null, loadedAt: Date.now(), lastError: null,
+  });
+  s.tv = s.target === 'tv';
+  ytSave();
+  const playerTabId = await ytOpenPlayer(startTime);
+  ytBroadcast();
+  return Object.assign(ytPublic(s), { playerTabId });
+}
+
+async function ytAdvance(dir, natural) {
+  const s = await ytGet();
+  let i = s.index + dir;
+  if (i >= s.items.length) {
+    const { 'ac:settings': settings } = await chrome.storage.local.get('ac:settings');
+    if (settings && settings.loop) i = 0;
+    else if (natural) { s.finished = true; ytSave(); ytBroadcast(); return; } else throw new Error('That was the last video.');
+  }
+  if (i < 0) { if (natural) i = 0; else throw new Error('This is the first video.'); }
+  Object.assign(s, { index: i, finished: false, endedFor: null, loadedAt: Date.now() });
+  ytSave();
+  await ytCmd({ cmd: 'load', id: s.items[i].id, force: true });
+  ytBroadcast();
+}
+
+async function ytStatus(tabId, st) {
+  const s = await ytGet();
+  if (tabId !== s.playerTabId || !st) return;
+  s.status = st;
+  const cur = s.items[s.index];
+  const key = cur && cur.id + ':' + s.index;
+  if (cur && st.state === 'ENDED' && st.videoId === cur.id && s.endedFor !== key) {
+    s.endedFor = key;
+    return ytAdvance(1, true);
+  }
+  // YouTube's own autoplay (or a stray click) swapped the video: put ours back
+  if (cur && st.ready && st.videoId && st.videoId !== cur.id && !st.ad && Date.now() - s.loadedAt > 6000 && !s.finished) {
+    s.loadedAt = Date.now();
+    ytCmd({ cmd: 'load', id: cur.id, force: true }).catch(() => {});
+  }
+  ytSave();
+  ytBroadcast();
+}
+
+async function ytPlayerError(tabId, info) {
+  const s = await ytGet();
+  if (tabId !== s.playerTabId) return;
+  const cur = s.items[s.index];
+  s.lastError = { id: info.videoId || (cur && cur.id), code: info.code, title: cur && cur.title };
+  ytSave();
+  await ytAdvance(1, true).catch(() => {});
+}
+
+async function ytControl(a) {
+  const s = await ytGet();
+  switch (a.action) {
+    case 'next': await ytAdvance(1, false); break;
+    case 'previous': await ytAdvance(-1, false); break;
+    case 'jump':
+      if (!(a.index >= 0 && a.index < s.items.length)) throw new Error('Video index out of range.');
+      Object.assign(s, { index: a.index, finished: false, endedFor: null, loadedAt: Date.now() });
+      ytSave();
+      await ytCmd({ cmd: 'load', id: s.items[a.index].id, force: true });
+      break;
+    case 'pause': await ytCmd({ cmd: 'pause' }); break;
+    case 'resume':
+    case 'play': await ytCmd({ cmd: 'play' }); break;
+    case 'toggle': await ytCmd({ cmd: 'toggle' }); break;
+    case 'seek':
+      if (a.time == null && a.delta == null) throw new Error('Give "time" or "delta" (seconds).');
+      await ytCmd({ cmd: 'seek', time: a.time, delta: a.delta });
+      break;
+    case 'volume':
+      if (!(a.level >= 0 && a.level <= 1)) throw new Error('level must be between 0 and 1.');
+      await ytCmd({ cmd: 'volume', level: a.level });
+      break;
+    case 'mute': await ytCmd({ cmd: 'mute', muted: a.muted !== false }); break;
+    case 'stop': {
+      const tab = await ytPlayerTab();
+      Object.assign(s, { playerTabId: null, status: null, finished: false });
+      ytSave();
+      if (tab) chrome.tabs.remove(tab.id).catch(() => {});
+      ytBroadcast();
+      return ytPublic(s);
+    }
+    case 'target': {
+      if (!['computer', 'tv'].includes(a.target)) throw new Error('target must be "computer" or "tv".');
+      s.target = a.target;
+      s.tv = a.target === 'tv';
+      ytSave();
+      const tab = await ytPlayerTab();
+      if (tab) await ytApplyTarget(tab);
+      ytBroadcast();
+      return ytPublic(s);
+    }
+    case 'show': {
+      const tab = await ytPlayerTab();
+      if (!tab) throw new Error('No player tab is open.');
+      await chrome.tabs.update(tab.id, { active: true });
+      await chrome.windows.update(tab.windowId, { focused: true });
+      return ytPublic(s);
+    }
+    default: throw new Error(`Unknown YouTube action “${a.action}”.`);
+  }
+  await sleep(700);
+  return ytPublic(await ytGet());
+}
+
+async function ytHello(tab) {
+  const s = await ytGet();
+  let isPlayer = tab.id === s.playerTabId;
+  if (!isPlayer && s.playerTabId == null && /[?&]ac_player=1/.test(tab.url || '') && s.items.length) {
+    s.playerTabId = tab.id; // adopt a player tab that outlived a service-worker restart
+    ytSave();
+    isPlayer = true;
+  }
+  const cur = isPlayer ? s.items[s.index] : null;
+  return { ok: true, player: isPlayer, tv: s.tv, current: cur ? { id: cur.id } : null, yt: ytPublic(s), queue: await ytQueue() };
+}
+
+async function ytFromTab(msg, tab) {
+  switch (msg.action) {
+    case 'hello': return ytHello(tab);
+    case 'get': return { ok: true, yt: ytPublic(await ytGet()), queue: await ytQueue() };
+    case 'status': await ytStatus(tab.id, msg.status); return { ok: true };
+    case 'error': await ytPlayerError(tab.id, msg); return { ok: true };
+    case 'play': return { ok: true, yt: await ytPlay(msg) };
+    case 'queueAdd': return Object.assign({ ok: true }, await ytQueueAdd(msg.videos, msg.next));
+    case 'queueRemove': return Object.assign({ ok: true }, await ytQueueRemove(msg.index));
+    case 'queueMove': return Object.assign({ ok: true }, await ytQueueMove(msg.from, msg.to));
+    case 'queueClear': return { ok: true, queue: await ytSetQueue([]) };
+    default: return { ok: true, yt: await ytControl(msg) };
+  }
+}
+
+function flashBadge(tabId, text) {
+  if (tabId == null) return;
+  chrome.action.setBadgeText({ tabId, text }).catch(() => {});
+  setTimeout(() => getStreams(tabId).then((l) => chrome.action.setBadgeText({ tabId, text: l.length ? String(l.length) : '' })).catch(() => {}), 1500);
+}
+
+function setupMenus() {
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'ac-yt-link', title: 'Add to Archive Cast queue', contexts: ['link'],
+      targetUrlPatterns: ['*://*.youtube.com/watch*', '*://*.youtube.com/shorts/*', '*://youtu.be/*'],
+    });
+    chrome.contextMenus.create({
+      id: 'ac-yt-page', title: 'Add this video to Archive Cast queue', contexts: ['page', 'video'],
+      documentUrlPatterns: ['*://*.youtube.com/watch*', '*://*.youtube.com/shorts/*'],
+    });
+  });
+}
+
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  const url = info.menuItemId === 'ac-yt-link' ? info.linkUrl : info.pageUrl || (tab && tab.url);
+  try { await ytQueueAdd([url]); flashBadge(tab && tab.id, '+1'); } catch (_) { flashBadge(tab && tab.id, '!'); }
 });
 
 // ================================================================ command routing
@@ -287,6 +626,13 @@ async function routeApi(cmd, args) {
       return CMDS.COMMANDS.map((c) => ({ name: c.name, scope: c.scope, description: c.description, args: Object.keys(c.args), required: c.required || [] }));
     case 'tabs': return listTabs();
     case 'open': return openUrl(args);
+    case 'youtubeQueue': return { queue: await ytQueue(), playback: ytPublic(await ytGet()) };
+    case 'youtubeAdd': return ytQueueAdd(args.videos, args.next);
+    case 'youtubeRemove': return ytQueueRemove(args.index);
+    case 'youtubeMove': return ytQueueMove(args.from, args.to);
+    case 'youtubeClear': return { queue: await ytSetQueue([]) };
+    case 'youtubePlay': return ytPlay({ videos: args.videos, index: args.index || 0, startTime: args.startTime || 0, target: args.target });
+    case 'youtubeControl': return ytControl(args);
     case 'reloadExtension':
       if (chrome.runtime.getManifest().update_url) throw new Error('Only unpacked (developer) installs can be reloaded this way.');
       setTimeout(() => chrome.runtime.reload(), 100);
@@ -378,6 +724,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes['ac:sites']) syncSiteScripts();
 });
 
-chrome.runtime.onInstalled.addListener(() => { syncSiteScripts(); });
+chrome.runtime.onInstalled.addListener(() => { syncSiteScripts(); setupMenus(); });
 chrome.runtime.onStartup.addListener(() => { connectBridge(); });
 connectBridge();

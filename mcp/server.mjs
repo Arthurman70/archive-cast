@@ -21,7 +21,7 @@ const { COMMANDS, byTool, schemaFor } = require('../lib/commands.js');
 const PORT = +(process.env.ARCHIVE_CAST_PORT || 47811);
 const HOST = '127.0.0.1';
 const PATH = '/archive-cast';
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const log = (...a) => process.stderr.write('[archive-cast] ' + a.join(' ') + '\n');
 
