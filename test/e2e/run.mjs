@@ -446,52 +446,98 @@ await step('YouTube: + queues a video; youtubeAdd takes links and looks up title
   await waitFor(() => ytTab.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.ep[data-i="2"] .rowbtn').classList.contains('in')), 4000, 'row shows ✓');
 });
 
-await step('YouTube: the queue plays in a player tab on this computer, in order, and YouTube’s own autoplay is kept out', async () => {
+await step('YouTube: playing from a watch page uses that tab (no new tab), in order, with YouTube’s own autoplay kept out', async () => {
+  const pagesBefore = (await browser.pages()).length;
   await api(ytTab, () => ArchiveCast.setSource('ytqueue'));
+  const t0 = Date.now();
   const st = await api(ytTab, () => ArchiveCast.play(0));
+  console.log(`    first video playing ${Date.now() - t0}ms after Play`);
   assert.equal(st.nowPlaying.title, 'Test Video 2');
   assert.equal(st.youtube.target, 'computer');
-  playerTab = await pageWhere(browser, (u) => u.includes('ac_player=1'));
+  assert.equal(st.youtube.isPlayerTab, true, 'the tab you clicked in became the player');
+  assert.equal((await browser.pages()).length, pagesBefore, 'no extra tab');
+  playerTab = ytTab;
   await waitFor(async () => (await state(ytTab)).nowPlaying?.index === 1, 12000, 'second video');
   await waitFor(async () => (await state(ytTab)).nowPlaying?.index === 2, 12000, 'third video');
   await waitFor(async () => (await state(ytTab)).nowPlaying?.idleReason === 'FINISHED', 12000, 'end of queue');
   await sleep(2500); // the fake would wander to a "suggested" video if autonav were still on
   assert.ok(!playerTab.url().includes('TestVideo05'), 'stayed put after the last video');
-  assert.deepEqual(await api(playerTab, () => window.__fakeyt.loads), ['TestVideo03', 'TestVideo04']);
+  assert.deepEqual(await api(playerTab, () => window.__fakeyt.loads), ['TestVideo02', 'TestVideo03', 'TestVideo04']);
 });
 
-await step('YouTube: remote control from another tab (pause, seek, next, previous, volume)', async () => {
-  await api(ytTab, () => ArchiveCast.play(0));
-  let st = await api(ytTab, () => ArchiveCast.pause());
+let remote;
+await step('YouTube: a panel on another page follows the queue that is playing (position, up next, buttons)', async () => {
+  remote = await browser.newPage();
+  await remote.goto('https://www.youtube.com/results?search_query=test');
+  await remote.waitForFunction(() => window.ArchiveCast && window.ArchiveCast.state && window.ArchiveCast.state.page.status === 'ready', { timeout: 15000 });
+  await api(remote, () => ArchiveCast.openPanel());
+  await api(remote, () => ArchiveCast.setSource('page')); // a different list from the one playing
+  await api(remote, () => ArchiveCast.call('youtubePlay', { index: 1 }));
+  await waitFor(async () => (await state(remote)).nowPlaying?.state === 'PLAYING', 8000, 'playing');
+  const card = () => remote.$eval('archive-cast-ui', (h) => {
+    const r = h.shadowRoot;
+    return { sub: r.querySelector('.now-sub').textContent, next: r.querySelector('.now-next').textContent,
+      prev: r.querySelector('.tbtn.prev').disabled, nextBtn: r.querySelector('.tbtn.next').disabled, highlighted: r.querySelectorAll('.ep.now').length };
+  });
+  const c = await card();
+  assert.equal((await state(remote)).nowPlaying.index, 1, 'position in the playing queue');
+  assert.match(c.sub, /2 of 3/);
+  assert.equal(c.next, 'Up next: Test Video 4');
+  assert.equal(c.prev, false);
+  assert.equal(c.nextBtn, false);
+  assert.equal(c.highlighted, 0, 'no row lights up in a list that is not the one playing');
+  let st = await api(remote, () => ArchiveCast.pause());
   assert.equal(st.nowPlaying.state, 'PAUSED');
-  st = await api(ytTab, () => ArchiveCast.seek(2));
+  st = await api(remote, () => ArchiveCast.seek(2));
   assert.ok(Math.abs(st.nowPlaying.time - 2) <= 1);
-  st = await api(ytTab, () => ArchiveCast.next());
-  assert.equal(st.nowPlaying.index, 1);
-  st = await api(ytTab, () => ArchiveCast.previous());
+  st = await api(remote, () => ArchiveCast.previous());
   assert.equal(st.nowPlaying.index, 0);
-  st = await api(ytTab, () => ArchiveCast.setVolume(0.3));
+  st = await api(remote, () => ArchiveCast.next());
+  assert.equal(st.nowPlaying.index, 1);
+  st = await api(remote, () => ArchiveCast.setVolume(0.3));
   assert.equal(st.cast.volume, 0.3);
+});
+
+await step('YouTube: a video you pick inside the player is not yanked back; the queue carries on after it', async () => {
+  await api(remote, () => ArchiveCast.call('youtubePlay', { index: 0 }));
+  await waitFor(async () => (await state(remote)).nowPlaying?.state === 'PLAYING', 8000, 'playing');
+  // what YouTube does when you click a related video in the player tab
+  await playerTab.evaluate(() => document.getElementById('movie_player').loadVideoById('TestVideo05'));
+  await sleep(7000); // the old logic pulled you back to the queue after 6 s
+  assert.equal(await playerTab.evaluate(() => document.getElementById('movie_player').getVideoData().video_id), 'TestVideo05', 'left alone');
+  const sub = await remote.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.now-sub').textContent);
+  assert.match(sub, /picked in the player/);
+  assert.equal((await state(remote)).nowPlaying.title, 'Suggested Video');
+  await playerTab.evaluate(() => document.getElementById('movie_player').seekTo(58.5, true)); // let it finish
+  await waitFor(async () => { const s = await state(remote); return s.nowPlaying?.index === 1 && s.nowPlaying.title === 'Test Video 3' && s.nowPlaying; }, 10000, 'queue resumed with the next video');
 });
 
 await step('YouTube TV mode: the player moves to its own window and fills it, ready to cast as a tab', async () => {
   const before = await sw.evaluate(() => chrome.windows.getAll().then((w) => w.length));
-  await api(ytTab, () => ArchiveCast.call('youtubeControl', { action: 'target', target: 'tv' }));
+  await api(remote, () => ArchiveCast.call('youtubeControl', { action: 'target', target: 'tv' }));
   await waitFor(() => playerTab.evaluate(() => document.documentElement.classList.contains('ac-tv')), 6000, 'TV mode on');
   assert.equal(await sw.evaluate(() => chrome.windows.getAll().then((w) => w.length)), before + 1, 'own window');
   const box = await playerTab.$eval('#movie_player', (el) => { const r = el.getBoundingClientRect(); return { w: r.width, h: r.height, vw: innerWidth, vh: innerHeight }; });
   assert.ok(box.w >= box.vw - 1 && box.h >= box.vh - 1, `player fills the window (${box.w}x${box.h} of ${box.vw}x${box.vh})`);
   assert.ok(await playerTab.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.launcher').hidden), 'no launcher on the TV picture');
-  const msg = await ytTab.$eval('archive-cast-ui', (h) => h.shadowRoot.querySelector('.msg').textContent).catch(() => '');
-  void msg;
-  await api(ytTab, () => ArchiveCast.call('youtubeControl', { action: 'target', target: 'computer' }));
+  await api(remote, () => ArchiveCast.call('youtubeControl', { action: 'target', target: 'computer' }));
   await waitFor(() => playerTab.evaluate(() => !document.documentElement.classList.contains('ac-tv')), 6000, 'TV mode off');
 });
 
 await step('YouTube: stop closes the player tab', async () => {
-  const st = await api(ytTab, () => ArchiveCast.stop());
+  const st = await api(remote, () => ArchiveCast.stop());
   assert.notEqual(st.cast.state, 'CONNECTED');
   await waitFor(() => playerTab.isClosed(), 5000, 'player closed');
+});
+
+await step('YouTube: starting from a page without a player opens a player tab', async () => {
+  const st = await api(remote, () => ArchiveCast.play(0)); // search results: nothing to play in place
+  assert.equal(st.youtube.isPlayerTab, false);
+  const player = await pageWhere(browser, (u) => u.includes('ac_player=1'));
+  await waitFor(async () => (await state(remote)).nowPlaying?.state === 'PLAYING', 8000, 'playing');
+  assert.equal(await player.evaluate(() => document.getElementById('movie_player').getVideoData().video_id), 'TestVideo04');
+  await api(remote, () => ArchiveCast.stop());
+  await remote.close();
 });
 
 await step('YouTube: right-click "Add to Archive Cast queue" (menu handler) and MCP-style queue commands', async () => {

@@ -231,7 +231,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // full-bleed ("TV mode") in its own window and the browser casts the tab, so the TV's YouTube app
 // is never involved and the browser's own ad blocking (e.g. Brave Shields) applies.
 const YT = self.ArchiveCastYouTube;
-const YT_DEFAULTS = { items: [], index: 0, target: 'computer', tv: false, playerTabId: null, status: null, finished: false, listKey: null, endedFor: null, loadedAt: 0, lastError: null };
+const YT_DEFAULTS = {
+  items: [], index: 0, target: 'computer', tv: false, playerTabId: null, status: null, finished: false, listKey: null,
+  endedFor: null, endedAt: 0, loadedAt: 0, lastError: null, detour: null,
+};
 let ytState = null;
 
 async function ytGet() {
@@ -318,7 +321,7 @@ function ytPublic(s) {
   return {
     active: s.playerTabId != null, target: s.target, tv: s.tv, index: s.index, finished: s.finished, listKey: s.listKey,
     items: s.items.map(({ id, title, channel, duration }) => ({ id, title, channel, duration })),
-    status: s.status, lastError: s.lastError, playerTabId: s.playerTabId,
+    status: s.status, lastError: s.lastError, playerTabId: s.playerTabId, detour: s.detour || null,
   };
 }
 
@@ -361,10 +364,15 @@ async function ytApplyTarget(tab) {
   chrome.tabs.sendMessage(tab.id, { type: 'yt-cmd', cmd: 'tv', on: s.tv }).catch(() => {});
 }
 
-async function ytOpenPlayer(startTime) {
+async function ytOpenPlayer(startTime, adoptTabId) {
   const s = await ytGet();
   const cur = s.items[s.index];
   let tab = await ytPlayerTab();
+  if (!tab && adoptTabId != null && s.target === 'computer') {
+    // play in the watch page you clicked from: no new tab to load, and that tab may already play sound
+    tab = await chrome.tabs.get(adoptTabId).catch(() => null);
+    if (tab) { s.playerTabId = tab.id; ytSave(); }
+  }
   if (tab) {
     await ytApplyTarget(tab);
     await chrome.tabs.sendMessage(tab.id, { type: 'yt-cmd', cmd: 'load', id: cur.id, start: startTime || 0, force: true }).catch(() => {});
@@ -378,7 +386,7 @@ async function ytOpenPlayer(startTime) {
   return tab.id;
 }
 
-async function ytPlay({ videos, index = 0, startTime = 0, target, listKey }) {
+async function ytPlay({ videos, index = 0, startTime = 0, target, listKey, adoptTabId }) {
   const s = await ytGet();
   let items;
   if (videos && [].concat(videos).length) items = await ytNormalize(videos);
@@ -391,11 +399,11 @@ async function ytPlay({ videos, index = 0, startTime = 0, target, listKey }) {
   if (target && !['computer', 'tv'].includes(target)) throw new Error('target must be "computer" or "tv".');
   Object.assign(s, {
     items: items.slice(0, 1000), index, target: target || s.target || 'computer', finished: false,
-    listKey: listKey || null, endedFor: null, loadedAt: Date.now(), lastError: null,
+    listKey: listKey || null, endedFor: null, loadedAt: Date.now(), lastError: null, detour: null,
   });
   s.tv = s.target === 'tv';
   ytSave();
-  const playerTabId = await ytOpenPlayer(startTime);
+  const playerTabId = await ytOpenPlayer(startTime, adoptTabId);
   ytBroadcast();
   return Object.assign(ytPublic(s), { playerTabId });
 }
@@ -409,7 +417,7 @@ async function ytAdvance(dir, natural) {
     else if (natural) { s.finished = true; ytSave(); ytBroadcast(); return; } else throw new Error('That was the last video.');
   }
   if (i < 0) { if (natural) i = 0; else throw new Error('This is the first video.'); }
-  Object.assign(s, { index: i, finished: false, endedFor: null, loadedAt: Date.now() });
+  Object.assign(s, { index: i, finished: false, endedFor: null, loadedAt: Date.now(), detour: null });
   ytSave();
   await ytCmd({ cmd: 'load', id: s.items[i].id, force: true });
   ytBroadcast();
@@ -421,14 +429,27 @@ async function ytStatus(tabId, st) {
   s.status = st;
   const cur = s.items[s.index];
   const key = cur && cur.id + ':' + s.index;
-  if (cur && st.state === 'ENDED' && st.videoId === cur.id && s.endedFor !== key) {
+  if (cur && st.state === 'ENDED' && st.videoId === cur.id && !s.detour && s.endedFor !== key) {
     s.endedFor = key;
+    s.endedAt = Date.now();
     return ytAdvance(1, true);
   }
-  // YouTube's own autoplay (or a stray click) swapped the video: put ours back
-  if (cur && st.ready && st.videoId && st.videoId !== cur.id && !st.ad && Date.now() - s.loadedAt > 6000 && !s.finished) {
-    s.loadedAt = Date.now();
-    ytCmd({ cmd: 'load', id: cur.id, force: true }).catch(() => {});
+  // A different video in the player tab, well after our last load (not the old one still reporting).
+  const foreign = cur && st.ready && st.videoId && st.videoId !== cur.id && !st.ad && Date.now() - s.loadedAt > 3000;
+  if (foreign && !s.finished) {
+    if (Date.now() - (s.endedAt || 0) < 4000 && !s.detour) {
+      // YouTube's own autoplay jumped in right after our video ended: put the queue back
+      s.loadedAt = Date.now();
+      ytCmd({ cmd: 'load', id: cur.id, force: true }).catch(() => {});
+    } else if (s.detour !== st.videoId) {
+      // you picked something else in the player tab: let it play, then carry on with the queue
+      s.detour = st.videoId;
+    } else if (st.state === 'ENDED' && s.endedFor !== 'detour:' + key) {
+      s.endedFor = 'detour:' + key;
+      return ytAdvance(1, true);
+    }
+  } else if (!foreign && s.detour && st.videoId === (cur && cur.id)) {
+    s.detour = null; // back on the queue's own video
   }
   ytSave();
   ytBroadcast();
@@ -450,7 +471,7 @@ async function ytControl(a) {
     case 'previous': await ytAdvance(-1, false); break;
     case 'jump':
       if (!(a.index >= 0 && a.index < s.items.length)) throw new Error('Video index out of range.');
-      Object.assign(s, { index: a.index, finished: false, endedFor: null, loadedAt: Date.now() });
+      Object.assign(s, { index: a.index, finished: false, endedFor: null, loadedAt: Date.now(), detour: null });
       ytSave();
       await ytCmd({ cmd: 'load', id: s.items[a.index].id, force: true });
       break;
@@ -516,7 +537,7 @@ async function ytFromTab(msg, tab) {
     case 'get': return { ok: true, yt: ytPublic(await ytGet()), queue: await ytQueue() };
     case 'status': await ytStatus(tab.id, msg.status); return { ok: true };
     case 'error': await ytPlayerError(tab.id, msg); return { ok: true };
-    case 'play': return { ok: true, yt: await ytPlay(msg) };
+    case 'play': return { ok: true, yt: await ytPlay(Object.assign({}, msg, { adoptTabId: msg.adopt ? tab.id : null })) };
     case 'queueAdd': return Object.assign({ ok: true }, await ytQueueAdd(msg.videos, msg.next));
     case 'queueRemove': return Object.assign({ ok: true }, await ytQueueRemove(msg.index));
     case 'queueMove': return Object.assign({ ok: true }, await ytQueueMove(msg.from, msg.to));

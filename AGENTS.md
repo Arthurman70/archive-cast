@@ -97,7 +97,8 @@ The extension ID is shown in Archive Cast's options page. It's derived from the 
 YouTube works differently from everything else. Its videos only play inside YouTube's own player, so Archive Cast doesn't send them to the Chromecast's Default Media Receiver. Instead:
 
 - **The queue** (`youtubeAdd` / `youtubeRemove` / `youtubeMove` / `youtubeClear`) is one list for the whole browser, stored by the extension.
-- **The player tab:** `youtubePlay` opens one youtube.com tab marked `ac_player=1` and drives YouTube's player in it: next video at the end, skip, seek, volume. YouTube's own "autoplay a suggestion" is switched off in that tab.
+- **The player tab:** `youtubePlay` opens one youtube.com tab marked `ac_player=1` and drives YouTube's player in it: next video at the end (about half a second later), skip, seek, volume. YouTube's own "autoplay a suggestion" is switched off in that tab. When a person starts the queue from the panel on a watch page, that tab becomes the player instead, with no new tab. If someone picks a different video inside the player tab, it is left alone (`youtube.detour` in the queue state), and the queue continues with the next item when it ends.
+- **Positions:** on YouTube, `nowPlaying.index` is the position in the list that is *playing* (`state.youtube.playingList` long). That matches `list_episodes` indexes only when the panel shows that same list.
 - **The target:**
   - `computer`: the player is a normal tab.
   - `tv`: the player moves to its own window, fills it edge to edge with no YouTube interface, and the panel tells the user to **Cast → Cast tab** from the browser menu. The browser does the casting, not the TV's YouTube app. In Brave, Shields' ad blocking therefore applies to what reaches the TV.

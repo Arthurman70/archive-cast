@@ -377,16 +377,22 @@
     if (!a || Date.now() - a.at > 120000) return;
     ensureSdk();
     toast('Starting the next episode on your Chromecast…', 'info');
+    // Press play as soon as the site's Cast session has re-joined, then give the player a couple of
+    // seconds to react before pressing again.
     const deadline = Date.now() + 40000;
-    let attempts = 0;
+    let attempts = 0, lastTry = 0;
     while (Date.now() < deadline) {
-      await sleep(2500);
+      await sleep(400);
       const m = S.cast && S.cast.site && S.cast.site.media;
       if (m && /PLAYING|BUFFERING/.test(m.playerState || '') && m.url !== a.prevUrl) {
         toast('Playing the next episode.', 'info');
         return;
       }
-      if (S.cast && S.cast.site && S.cast.site.connected && attempts < 4) { send('sitePlay'); attempts++; }
+      if (S.cast && S.cast.site && S.cast.site.connected && attempts < 5 && Date.now() - lastTry > 2500) {
+        send('sitePlay');
+        attempts++;
+        lastTry = Date.now();
+      }
     }
     toast('I opened the next episode but couldn’t start this site’s player — press play on the page.', 'warn');
   }
@@ -448,7 +454,13 @@
     const st = active ? yt.status : null;
     let media = null;
     if (active && yt.finished) media = { playerState: 'IDLE', idleReason: 'FINISHED', time: null, duration: null };
-    else if (active && cur) {
+    else if (active && yt.detour && st && st.ready) {
+      // you picked another video inside the player tab: show it; the queue resumes after it
+      media = {
+        playerState: st.state === 'ENDED' ? 'BUFFERING' : st.state, idleReason: null, time: st.time, duration: st.duration || null,
+        url: YTL.watchUrl(st.videoId), custom: { id: 'yt', f: st.videoId }, title: st.title || st.videoId, subtitle: st.author || 'YouTube',
+      };
+    } else if (active && cur) {
       const ours = st && st.ready && st.videoId === cur.id;
       const state = !ours ? 'BUFFERING' : st.state === 'ENDED' ? 'BUFFERING' : st.state;
       media = {
@@ -661,9 +673,13 @@ html.ac-tv, html.ac-tv * { cursor: none !important; }`;
 
   function ytStart(i, startTime) {
     setPending(i);
-    // don't let this tab's own video play over the queue
-    if (!S.isPlayer) for (const v of document.querySelectorAll('video')) { try { v.pause(); } catch (_) { /* ignore */ } }
-    ytCall('play', { videos: S.eps.map(ytVideo), index: i, startTime: startTime || 0, target: S.ytTarget, listKey: S.source })
+    // On a watch page, playing "on this computer" happens right here: no new tab to load, and the
+    // browser already lets this tab play sound because you just clicked in it.
+    const adopt = S.ytTarget === 'computer' && location.pathname === '/watch' && !!document.getElementById('movie_player')
+      && !(S.yt && S.yt.active); // an existing player tab keeps the job
+    // otherwise don't let this tab's own video play over the queue
+    if (!S.isPlayer && !adopt) for (const v of document.querySelectorAll('video')) { try { v.pause(); } catch (_) { /* ignore */ } }
+    ytCall('play', { videos: S.eps.map(ytVideo), index: i, startTime: startTime || 0, target: S.ytTarget, listKey: S.source, adopt })
       .catch((e) => { setPending(null); toast(e.message, 'error'); });
     renderList();
   }
@@ -685,8 +701,20 @@ html.ac-tv, html.ac-tv * { cursor: none !important; }`;
     } else loadFrom(i, startTime);
   }
 
+  // On YouTube the list that's playing is often not the list on screen (you browse while it
+  // plays), so positions only line up when the two lists are the same.
+  function ytListShown() {
+    const yt = S.yt;
+    return !!(yt && yt.active && yt.items.length === S.eps.length && yt.items.every((v, n) => v.id === S.eps[n].file));
+  }
+
+  function playingIndex(m) {
+    if (!IS_YOUTUBE) return indexOfMedia(m);
+    return m && ytListShown() && !S.yt.detour ? S.yt.index : -1;
+  }
+
   function currentIndex() {
-    return S.cast && S.cast.media ? indexOfMedia(S.cast.media) : -1;
+    return S.cast && S.cast.media ? playingIndex(S.cast.media) : -1;
   }
 
   function navigate(dir) {
@@ -713,7 +741,7 @@ html.ac-tv, html.ac-tv * { cursor: none !important; }`;
       store.set('ac:castingAt' + ORIGIN_KEY, now);
     }
     const m = st.media;
-    const i = indexOfMedia(m);
+    const i = playingIndex(m);
     if (i >= 0) {
       if (S.pending === i && m.playerState !== 'IDLE') setPending(null);
       if (!IS_YOUTUBE) track(i, m);
@@ -869,7 +897,9 @@ html.ac-tv, html.ac-tv * { cursor: none !important; }`;
   function publicState() {
     const st = S.cast || {};
     const m = st.media;
-    const i = indexOfMedia(m);
+    const i = playingIndex(m);
+    // on YouTube, nowPlaying.index is the position in the list that is playing (see youtube.playingList)
+    const pos = IS_YOUTUBE ? (S.yt && S.yt.active ? S.yt.index : null) : i >= 0 ? i : null;
     return {
       version: VERSION,
       site: location.hostname,
@@ -884,7 +914,7 @@ html.ac-tv, html.ac-tv * { cursor: none !important; }`;
         error: st.sdkError || null, loadingQueue: !!st.loading,
       },
       nowPlaying: m ? {
-        index: i >= 0 ? i : null, title: i >= 0 ? S.eps[i].title : m.title, state: m.playerState, idleReason: m.idleReason || null,
+        index: pos, title: i >= 0 ? S.eps[i].title : m.title, state: m.playerState, idleReason: m.idleReason || null,
         time: m.time == null ? null : Math.round(m.time), duration: m.duration || (i >= 0 ? S.eps[i].duration : null) || null,
       } : null,
       sitePlayer: st.site || null,
@@ -1041,14 +1071,16 @@ html.ac-tv, html.ac-tv * { cursor: none !important; }`;
   };
 
   function requireMedia() {
-    if (!isActive(S.cast && S.cast.media)) throw new Error('Nothing is playing on the Chromecast.');
+    if (!isActive(S.cast && S.cast.media)) throw new Error(IS_YOUTUBE ? 'Nothing is playing.' : 'Nothing is playing on the Chromecast.');
   }
 
   async function step(dir) {
     requireMedia();
-    const from = currentIndex();
+    const pos = () => (IS_YOUTUBE ? (S.yt ? S.yt.index : -1) : currentIndex());
+    const from = pos();
     navigate(dir);
-    return waitFor(() => currentIndex() !== from && isActive(S.cast.media), 20000, 'The Chromecast didn’t change episode.');
+    return waitFor(() => pos() !== from && isActive(S.cast.media), 20000,
+      IS_YOUTUBE ? 'The player didn’t change video.' : 'The Chromecast didn’t change episode.');
   }
 
   async function runApi(cmd, args) {
@@ -1131,7 +1163,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, .ep:focus-visib
   background: var(--bg); border-radius: 14px; display: flex; flex-direction: column; overflow: hidden;
   box-shadow: 0 18px 60px rgba(0,0,0,.45), 0 0 0 1px rgba(255,255,255,.07) inset;
 }
-@media (max-width: 440px) { .panel { right: 8px; left: 8px; bottom: 8px; width: auto; max-height: calc(100vh - 16px); } }
+/* with a list, keep a steady size so rows don't slide under the cursor as the list fills in */
+.panel.tall { height: min(600px, calc(100vh - 40px)); }
+@media (max-width: 440px) { .panel { right: 8px; left: 8px; bottom: 8px; width: auto; max-height: calc(100vh - 16px); } .panel.tall { height: calc(100vh - 16px); } }
 header { display: flex; align-items: center; gap: 8px; padding: 12px 12px 10px 16px; }
 .brand { font-weight: 650; letter-spacing: .01em; flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
 .brand .ic { color: var(--accent); }
@@ -1486,13 +1520,22 @@ footer .btn:hover { color: var(--fg); }
       });
     }
 
-    const i = indexOfMedia(m);
+    const i = playingIndex(m);
     const ep = i >= 0 ? S.eps[i] : null;
     const site = st && st.site;
+    const yq = IS_YOUTUBE && S.yt && S.yt.active ? S.yt : null; // the YouTube list that is actually playing
     if (m && m.playerState !== 'IDLE') {
       $.title.textContent = ep ? ep.title : m.title || 'Casting';
-      $.sub.textContent = ep ? `${ep.show} · ${i + 1} of ${S.eps.length}` : m.subtitle || '';
-      $.next.textContent = ep && S.eps[i + 1] ? 'Up next: ' + S.eps[i + 1].title : '';
+      if (yq && yq.detour) {
+        $.sub.textContent = `${m.subtitle || 'YouTube'} · picked in the player`;
+        $.next.textContent = yq.items[yq.index + 1] ? 'Then the queue continues: ' + yq.items[yq.index + 1].title : '';
+      } else if (yq) {
+        $.sub.textContent = `${m.subtitle || 'YouTube'} · ${yq.index + 1} of ${yq.items.length}`;
+        $.next.textContent = yq.items[yq.index + 1] ? 'Up next: ' + yq.items[yq.index + 1].title : '';
+      } else {
+        $.sub.textContent = ep ? `${ep.show} · ${i + 1} of ${S.eps.length}` : m.subtitle || '';
+        $.next.textContent = ep && S.eps[i + 1] ? 'Up next: ' + S.eps[i + 1].title : '';
+      }
     } else if (m && m.playerState === 'IDLE' && m.idleReason === 'FINISHED') {
       $.title.textContent = 'Finished';
       $.sub.textContent = 'Reached the end of the queue.';
@@ -1519,8 +1562,10 @@ footer .btn:hover { color: var(--fg); }
 
     const active = !!(m && m.playerState !== 'IDLE');
     for (const el of [$.play, $.back, $.fwd, $.bar]) el.disabled = !active;
-    $.prev.disabled = !active || i === 0;
-    $.nextBtn.disabled = !active || (i >= 0 && i === S.eps.length - 1 && !S.settings.loop);
+    const at = yq ? yq.index : i;
+    const len = yq ? yq.items.length : S.eps.length;
+    $.prev.disabled = !active || at === 0;
+    $.nextBtn.disabled = !active || (at >= 0 && at === len - 1 && !S.settings.loop);
     setHTML($.play, svg(m && (m.playerState === 'PLAYING' || m.playerState === 'BUFFERING') ? 'pause' : 'play'));
     const dur = (m && (m.duration || (ep && ep.duration))) || 0;
     if (!S.seeking) {
@@ -1585,10 +1630,15 @@ footer .btn:hover { color: var(--fg); }
     if (!$ || !S.open) return;
     const key = S.status + '|' + S.eps.length + '|' + (S.eps[0] && S.eps[0].url) + '|' + S.source;
     if (force || key !== listKey) {
+      // the same list growing or refreshing keeps its scroll position; a different list starts at the top
+      const sameList = listKey && listKey.split('|').pop() === S.source && S.status === 'ready';
+      const top = sameList ? $.list.scrollTop : 0;
       listKey = key;
       $.list.innerHTML = listHtml();
       applyFilter();
-      S.scrolledTo = null;
+      $.panel.classList.toggle('tall', S.eps.length > 0);
+      if (sameList) $.list.scrollTop = top;
+      else S.scrolledTo = null;
     }
     const cur = currentIndex();
     const queued = IS_YOUTUBE ? new Set(S.ytQueue.map((v) => v.id)) : null;

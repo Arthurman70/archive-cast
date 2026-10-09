@@ -20,7 +20,7 @@
   const API = 'archive-cast:api';
   const API_RES = 'archive-cast:api-result';
   const PUB = 'archive-cast:public';
-  const VERSION = '2.1.0';
+  const VERSION = '2.2.0';
   const SDK_URL = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
   const DMR = 'CC1AD845'; // Default Media Receiver
   const MAX_CHUNK_BYTES = 40000; // Cast messages are capped at 64KB
@@ -96,12 +96,18 @@
     return safe(() => window.cast.framework.CastContext.getInstance().getCurrentSession(), null);
   }
 
+  let hookedSiteMedia = null;
   function siteSnapshot() {
     if (mode !== 'shared') return null;
     const s = siteCastSession();
     if (!s) return { connected: false };
     const m = safe(() => s.getMediaSession(), null);
     const mi = (m && m.media) || {};
+    if (m && m !== hookedSiteMedia) {
+      // report the site's media changes (like an episode ending) right away, not on the next tick
+      hookedSiteMedia = m;
+      safe(() => m.addUpdateListener(() => setTimeout(emit, 0)));
+    }
     return {
       connected: true,
       device: safe(() => s.getCastDevice().friendlyName, null),
@@ -149,6 +155,17 @@
     s.src = SDK_URL;
     s.onerror = () => fail('Could not load the Google Cast library.');
     (document.head || document.documentElement).appendChild(s);
+    // Safety net: if the page's own player loaded Cast first, its "ready" callback may already have
+    // fired. Once Cast is plainly usable, don't keep waiting for a callback that won't come.
+    const started = Date.now();
+    const poll = setInterval(() => {
+      if (sdk !== 'loading') return clearInterval(poll);
+      if (Date.now() - started > 3000 && window.cast && cast.framework && window.chrome && chrome.cast && chrome.cast.isAvailable) {
+        clearInterval(poll);
+        document.removeEventListener('securitypolicyviolation', onViolation);
+        initCaf();
+      }
+    }, 500);
     setTimeout(() => { if (sdk === 'loading') fail('Timed out loading the Google Cast library.'); }, 20000);
   }
 
@@ -162,11 +179,17 @@
   function initCaf() {
     if (sdk === 'ready') return;
     ctx = cast.framework.CastContext.getInstance();
-    ctx.setOptions({
-      receiverApplicationId: DMR,
-      autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
-      resumeSavedSession: true,
-    });
+    try {
+      ctx.setOptions({
+        receiverApplicationId: DMR,
+        autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
+        resumeSavedSession: true,
+      });
+    } catch (_) {
+      ctx = null; // the page configured Cast first and won't take new options: share it instead
+      sdk = 'idle';
+      return initShared();
+    }
     const E = cast.framework.CastContextEventType;
     ctx.addEventListener(E.CAST_STATE_CHANGED, emit);
     ctx.addEventListener(E.SESSION_STATE_CHANGED, () => { attachCaf(ctx.getCurrentSession()); emit(); });
